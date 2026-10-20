@@ -11,127 +11,283 @@ h2 { color:#ebcb8b; margin-top:32px; }
 a { color:#5de8ff; }
 .card { background:#111a2a; border:1px solid #1e3a5f; border-radius:12px; padding:20px; margin:16px 0; }
 .small { color:#8c95a0; font-size:0.9em; }
-hr { border:0; border-top:1px solid #1e3a5f; margin:32px 0; }
+.lang { display:inline-block; margin:0 8px 0 0; padding:6px 14px; border:1px solid #1e3a5f; border-radius:8px; text-decoration:none; }
+hr { border:0; border-top:1px solid #1e3a5f; margin:40px 0; }
 ul { padding-left:20px; }
 </style>
 </head>
 <body>
+<p><a class="lang" href="#it">🇮🇹 Italiano</a><a class="lang" href="#en">🇬🇧 English</a></p>
+
+<!-- ============================== ITALIANO ============================== -->
+<section id="it">
 <h1>PRIVACY POLICY - NEXUS CORE</h1>
-<p class="small">Ultimo aggiornamento: 6 Ottobre 2026<br>App: Nexus Core (com.nexuscore.game)<br>Versione valida per Play Store e AdMob</p>
+<p class="small">Ultimo aggiornamento: 20 Ottobre 2026<br>App: Nexus Core (com.nexus.game)<br>Versione valida per Google Play e AdMob</p>
 
 <div class="card">
 <h2>1. TITOLARE DEL TRATTAMENTO</h2>
 <p><strong>Flavio Berti</strong> - NeonCore Studio<br>
 Email: <a href="mailto:flavio@flavioberti.it">flavio@flavioberti.it</a><br>
-Sede: Sant'Arcangelo di Romagna, Emilia-Romagna, Italia<br>
+Sede: Santarcangelo di Romagna, Emilia-Romagna, Italia<br>
 Contatto privacy: flavio@flavioberti.it (oggetto: "Privacy - Nexus Core")</p>
 </div>
 
 <h2>2. DATI RACCOLTI</h2>
 <p>L'app Nexus Core raccoglie:</p>
 <ul>
-<li><strong>Nickname giocatore</strong> (inserito da te)</li>
-<li><strong>ID utente anonimo</strong> (generato automaticamente)</li>
-<li><strong>Dati di gioco:</strong> CORE, Gold, Frammenti, carte possedute, livello, progresso Scavo/Flotta/Battaglie, mazzi</li>
-<li><strong>Dati tecnici:</strong> modello dispositivo, versione OS, lingua, log crash anonimi</li>
-<li><strong>Se usi Flotta online:</strong> messaggi chat Flotta, nome Flotta, icona, difesa 3x3</li>
+<li><strong>Nickname giocatore</strong> (scelto da te)</li>
+<li><strong>ID utente anonimo</strong> (generato automaticamente, non legato a email o numero di telefono)</li>
+<li><strong>Dati di gioco:</strong> CORE, Gold, Frammenti, carte possedute e livelli di fusione, livello, mazzi, progresso di Scavo, Battaglie e Flotta</li>
+<li><strong>Dati tecnici:</strong> modello del dispositivo, versione del sistema operativo, lingua, log crash anonimi</li>
+<li><strong>Se entri in una Flotta:</strong>
+  <ul>
+  <li>nome, stemma, descrizione e codice della Flotta, il tuo grado (Comandante, Capitano, Pilota)</li>
+  <li>la tua <strong>difesa di guerra</strong> (20 carte con le stelle di fusione) e se partecipi alle guerre</li>
+  <li>risultati delle guerre: attacchi, punti, premi, storico, baule di guerra</li>
+  <li>i <strong>messaggi della chat</strong> di Flotta che scrivi</li>
+  <li>le <strong>segnalazioni</strong> di messaggi che invii (messaggio segnalato, chi segnala, motivo)</li>
+  <li>gli <strong>avvisi in gioco</strong> che ti riguardano (es. "la tua difesa è stata attaccata")</li>
+  </ul>
+</li>
 <li><strong>Se guardi video premio:</strong> interazioni con annunci (tramite Google AdMob)</li>
-<li><strong>Se acquisti pack:</strong> ID prodotto acquistato (gestione Google Play Billing, non vediamo dati carta)</li>
+<li><strong>Se acquisti pack:</strong> ID del prodotto acquistato (gestione Google Play Billing, non vediamo i dati della carta)</li>
 </ul>
-<p><strong>NON raccogliamo:</strong> nome reale, email (a parte quella che ci scrivi tu), posizione precisa GPS, contatti, foto, rubrica.</p>
+<p><strong>NON raccogliamo:</strong> nome reale, email (a parte quella che ci scrivi tu), numero di telefono, posizione precisa GPS, contatti, foto, rubrica.</p>
 
 <h2>3. COME USIAMO I DATI</h2>
 <ul>
-<li>Salvataggio progresso su dispositivo (user://) e su server Supabase (per Flotta e backup)</li>
-<li>Matchmaking Flotta e guerre 24h (Martedì 21:00 / Venerdì 15:00)</li>
-<li>Classifiche e trofei</li>
-<li>Mostrare video con premio opzionale (1 ogni ora) tramite AdMob</li>
-<li>Gestire acquisti in-app (pack Bronzo/Argento/Oro/Stella, Gold, Core)</li>
-<li>Supporto e debug crash</li>
+<li>Salvare il progresso sul dispositivo e sul server Supabase (Flotta, guerre, backup)</li>
+<li>Abbinare le Flotte nelle guerre di Flotta (automatiche il martedì alle 21:00 e il sabato alle 15:00, ora italiana, durata 24 ore)</li>
+<li>Mostrare classifiche, storico delle guerre e trofei</li>
+<li>Far funzionare la chat di Flotta e la moderazione (segnalazioni, filtro parolacce)</li>
+<li>Mostrare video con premio opzionali tramite AdMob</li>
+<li>Gestire gli acquisti in-app (pack, Gold, Core, rimozione annunci)</li>
+<li>Supporto e correzione dei crash</li>
 </ul>
-<p><strong>Base legale:</strong> esecuzione contratto (gioco), legittimo interesse (miglioramento gioco), consenso per annunci personalizzati (UMP in EU).</p>
+<p><strong>Base legale:</strong> esecuzione del contratto (fornire il gioco), legittimo interesse (sicurezza, moderazione e miglioramento del gioco), consenso per gli annunci personalizzati (UMP in UE).</p>
 
-<h2>4. DOVE SONO SALVATI</h2>
+<h2>4. CHAT DI FLOTTA E MODERAZIONE</h2>
 <ul>
-<li><strong>Locale:</strong> dispositivo tuo (user://daily_quests.dat, GameState)</li>
-<li><strong>Cloud:</strong> Supabase (UE, GDPR compliant) - dati di gioco e chat Flotta</li>
-<li><strong>Backup:</strong> se esporti, file base64 creato da te, tu decidi dove salvarlo</li>
+<li>I messaggi sono visibili solo ai membri della tua Flotta.</li>
+<li>Un filtro automatico sostituisce le parolacce con asterischi prima di salvare il messaggio.</li>
+<li>Puoi <strong>segnalare</strong> un messaggio: la segnalazione arriva a noi per la verifica. Il Comandante e i Capitani possono cancellare i messaggi della Flotta.</li>
+<li>Puoi <strong>silenziare</strong> un giocatore: questa scelta resta solo sul tuo dispositivo.</li>
+<li>Non scrivere in chat dati personali (indirizzo, telefono, email).</li>
 </ul>
 
-<h2>5. CONDIVISIONE</h2>
-<p>Non vendiamo dati. Condividiamo solo con:</p>
+<h2>5. NOTIFICHE</h2>
+<p>Il gioco usa <strong>notifiche locali</strong>, programmate sul tuo dispositivo (inizio e fine guerra, ticket pieni, ricompense). Non usiamo servizi di notifica push e non raccogliamo identificativi per le notifiche. Puoi disattivarle in qualsiasi momento dalle impostazioni di Android.</p>
+
+<h2>6. DOVE SONO SALVATI</h2>
 <ul>
-<li><strong>Supabase</strong> (hosting dati gioco) - DPA firmato, server UE - <a href="https://supabase.com/privacy" target="_blank">Privacy</a></li>
-<li><strong>Google AdMob</strong> (video con premio opzionale): ID pubblicitario Android, indirizzo IP approssimativo, interazioni annuncio, informazioni dispositivo. Privacy: <a href="https://policies.google.com/privacy" target="_blank">policies.google.com/privacy</a> - Tecnologie annunci: <a href="https://policies.google.com/technologies/ads" target="_blank">policies.google.com/technologies/ads</a>. Opt-out: Impostazioni Android > Privacy > Annunci > Elimina ID pubblicitario.</li>
-<li><strong>Google Play Billing</strong> (acquisti in-app): gestito interamente da Google, noi riceviamo solo conferma acquisto (es. "pack_oro_499 acquistato"), non numero carta. Privacy: <a href="https://policies.google.com/privacy" target="_blank">Google Privacy</a></li>
-<li><strong>Google Play Services</strong> (per aggiornamenti e billing)</li>
-<li><strong>Altri giocatori:</strong> vedono solo nickname, icona Flotta, difesa 3x3 (non email)</li>
+<li><strong>Locale:</strong> sul tuo dispositivo (salvataggio del gioco, impostazioni, giocatori silenziati)</li>
+<li><strong>Cloud:</strong> Supabase (server UE, conforme al GDPR): dati di gioco online, Flotta, guerre, chat e avvisi</li>
+<li><strong>Backup:</strong> se lo esporti, un codice base64 creato da te: decidi tu dove conservarlo</li>
 </ul>
 
-<h2>6. CONSERVAZIONE</h2>
+<h2>7. CONDIVISIONE</h2>
+<p>Non vendiamo dati. Li condividiamo solo con:</p>
 <ul>
-<li>Dati locali: finché non disinstalli o cancelli salvataggio da Impostazioni > Cancella</li>
-<li>Dati cloud Flotta: finché Flotta esiste o 12 mesi di inattività</li>
-<li>Chat Flotta: 30 giorni</li>
-<li>Dati AdMob: secondo policy Google (fino a 14 mesi)</li>
-<li>Puoi chiedere cancellazione scrivendo a flavio@flavioberti.it</li>
+<li><strong>Supabase</strong> (hosting dei dati di gioco) - DPA firmato, server UE - <a href="https://supabase.com/privacy" target="_blank">Privacy</a></li>
+<li><strong>Google AdMob</strong> (video con premio opzionali): ID pubblicitario Android, indirizzo IP approssimativo, interazioni con gli annunci, informazioni sul dispositivo. Privacy: <a href="https://policies.google.com/privacy" target="_blank">policies.google.com/privacy</a> - Tecnologie annunci: <a href="https://policies.google.com/technologies/ads" target="_blank">policies.google.com/technologies/ads</a>. Opt-out: Impostazioni Android &gt; Privacy &gt; Annunci &gt; Elimina ID pubblicitario.</li>
+<li><strong>Google Play Billing</strong> (acquisti in-app): gestito interamente da Google, noi riceviamo solo la conferma dell'acquisto, mai i dati della carta. Privacy: <a href="https://policies.google.com/privacy" target="_blank">Google Privacy</a></li>
+<li><strong>Google Play Services</strong> (aggiornamenti e acquisti)</li>
+<li><strong>Altri giocatori:</strong> vedono il tuo nickname, la tua Flotta (nome, stemma, descrizione), il tuo grado, le carte della tua difesa di guerra, i tuoi punti e risultati in guerra e i messaggi che scrivi nella chat della tua Flotta. Non vedono mai il tuo ID o la tua email.</li>
 </ul>
 
-<h2>7. DIRITTI GDPR (UE)</h2>
-<p>Essendo in Italia (UE), hai diritto a: accesso, rettifica, cancellazione, limitazione, portabilità, opposizione, revoca consenso annunci.</p>
-<p>Scrivi a: <a href="mailto:flavio@flavioberti.it">flavio@flavioberti.it</a> con oggetto "GDPR - [tuo nickname]"<br>
-Rispondiamo entro 30 giorni.</p>
-<p>Puoi anche presentare reclamo al Garante Privacy Italiano.</p>
-
-<h2>8. MINORI</h2>
-<p>Gioco 7+. Non raccogliamo consapevolmente dati di minori &lt;13 senza consenso genitoriale. Se sei genitore e pensi abbiamo dati di tuo figlio, scrivici a flavio@flavioberti.it per cancellazione immediata.</p>
-
-<h2>9. SICUREZZA</h2>
+<h2>8. CONSERVAZIONE</h2>
 <ul>
-<li>Connessioni HTTPS/TLS a Supabase</li>
-<li>Auth token anonimo, no password in chiaro</li>
-<li>Backup esportabile/importabile da te (base64) - custodiscilo, contiene tutto il progresso</li>
-<li>Acquisti verificati tramite Google Play Billing (nessun dato carta salvato da noi)</li>
-<li>Se cambi telefono: usa Esporta in Nexus -> copia codice -> Importa su nuovo telefono</li>
+<li>Dati locali: finché non disinstalli il gioco o cancelli il salvataggio</li>
+<li>Dati cloud di gioco e Flotta: finché esiste il tuo account, così puoi riprendere a giocare anche dopo molto tempo. Puoi chiederne la cancellazione in qualsiasi momento (vedi punto 9)</li>
+<li>Chat di Flotta: 14 giorni</li>
+<li>Avvisi in gioco: 30 giorni</li>
+<li>Segnalazioni: il tempo necessario alla verifica, al massimo 12 mesi</li>
+<li>Storico delle guerre e premi: finché esiste il tuo account</li>
+<li>Dati AdMob: secondo la policy di Google (fino a 14 mesi)</li>
 </ul>
 
-<h2>10. COOKIE / TRACKING / PUBBLICITÀ</h2>
+<h2>9. CANCELLAZIONE DELL'ACCOUNT E DEI DATI</h2>
 <div class="card">
-<p><strong>L'app mostra video opzionali con premio</strong> tramite Google AdMob (plugin Cengiz - Godot Android AdMob).</p>
-<p>AdMob può usare:</p>
-<ul>
-<li>ID pubblicitario Android per mostrare annunci più pertinenti</li>
-<li>Indirizzo IP approssimativo per geolocalizzazione generale (es. paese)</li>
-<li><strong>UMP (User Messaging Platform):</strong> in EU (Italia) ti mostreremo un popup per chiedere consenso ad annunci personalizzati, come richiesto da Google. Puoi scegliere "Personalizzati" o "Non personalizzati". Puoi cambiare scelta in qualsiasi momento da Impostazioni app > Privacy > Gestisci consenso.</li>
-</ul>
-<p><strong>Come disattivare personalizzazione:</strong><br>
-Android > Impostazioni > Privacy > Annunci > Disattiva personalizzazione annunci OPPURE Elimina ID pubblicitario</p>
-<p><strong>Acquisti per rimuovere annunci:</strong> esiste prodotto "no_ads" (2,99€) che rimuove i video promozionali e dà 300 Gold.</p>
-<p>No Facebook Pixel. No altri tracker oltre AdMob e Play Billing.</p>
+<p>Per cancellare il tuo account e <strong>tutti i dati di gioco</strong> sui nostri server scrivi a <a href="mailto:flavio@flavioberti.it?subject=Cancellazione%20account%20-%20Nexus%20Core">flavio@flavioberti.it</a> con oggetto "Cancellazione account - Nexus Core", indicando il tuo <strong>nickname</strong> e, se possibile, il nome della tua Flotta.</p>
+<p>Cancelliamo account, progressi online, difese, partecipazioni alle guerre, messaggi e avvisi <strong>entro 30 giorni</strong> e ti confermiamo via email. Possiamo conservare solo ciò che è obbligatorio per legge (es. dati degli acquisti gestiti da Google). I dati sul tuo telefono si cancellano disinstallando il gioco.</p>
 </div>
 
-<h2>11. MODIFICHE</h2>
-<p>Se cambiamo policy, avviso in gioco + nuova data qui. Versione attuale in app: Impostazioni -> Privacy. Controlla periodicamente questa pagina.</p>
+<h2>10. DIRITTI GDPR (UE)</h2>
+<p>Hai diritto a: accesso, rettifica, cancellazione, limitazione, portabilità, opposizione, revoca del consenso agli annunci.</p>
+<p>Scrivi a: <a href="mailto:flavio@flavioberti.it">flavio@flavioberti.it</a> con oggetto "GDPR - [tuo nickname]".<br>
+Rispondiamo entro 30 giorni.</p>
+<p>Puoi anche presentare reclamo al Garante per la protezione dei dati personali (<a href="https://www.garanteprivacy.it" target="_blank">garanteprivacy.it</a>).</p>
 
-<h2>12. CONTATTI</h2>
-<p>Per privacy: <a href="mailto:flavio@flavioberti.it">flavio@flavioberti.it</a><br>
-Per supporto gioco: Discord / Email flavio@flavioberti.it<br>
-Titolare: Flavio Berti, Sant'Arcangelo di Romagna (RN), Italia</p>
+<h2>11. MINORI</h2>
+<p>Gioco classificato <strong>7+</strong>. Non raccogliamo consapevolmente dati di minori di 13 anni senza il consenso dei genitori. La chat di Flotta ha un filtro automatico per le parolacce, la possibilità di segnalare i messaggi e di silenziare i giocatori. Se sei un genitore e pensi che tuo figlio ci abbia fornito dati, scrivici a flavio@flavioberti.it: li cancelliamo subito.</p>
+
+<h2>12. SICUREZZA</h2>
+<ul>
+<li>Connessioni cifrate HTTPS/TLS</li>
+<li>Accesso anonimo con token, nessuna password salvata in chiaro</li>
+<li>Dati sul server protetti da regole di accesso: ogni giocatore può leggere e modificare solo ciò che gli spetta</li>
+<li>Backup esportabile e importabile da te (base64): custodiscilo, contiene tutto il progresso</li>
+<li>Acquisti verificati tramite Google Play Billing (nessun dato della carta salvato da noi)</li>
+</ul>
+
+<h2>13. COOKIE / TRACKING / PUBBLICITÀ</h2>
+<div class="card">
+<p><strong>L'app mostra video opzionali con premio</strong> tramite Google AdMob.</p>
+<p>AdMob può usare:</p>
+<ul>
+<li>l'ID pubblicitario Android per mostrare annunci più pertinenti</li>
+<li>l'indirizzo IP approssimativo per una geolocalizzazione generale (es. il paese)</li>
+<li><strong>UMP (User Messaging Platform):</strong> in UE ti mostriamo un popup per chiedere il consenso agli annunci personalizzati, come richiesto da Google. Puoi scegliere "Personalizzati" o "Non personalizzati" e cambiare scelta in qualsiasi momento.</li>
+</ul>
+<p><strong>Come disattivare la personalizzazione:</strong><br>
+Android &gt; Impostazioni &gt; Privacy &gt; Annunci &gt; Disattiva personalizzazione annunci OPPURE Elimina ID pubblicitario</p>
+<p><strong>Rimozione annunci:</strong> il prodotto "no_ads" rimuove i video promozionali.</p>
+<p>Nessun Facebook Pixel. Nessun altro tracker oltre ad AdMob e Play Billing.</p>
+</div>
+
+<h2>14. MODIFICHE</h2>
+<p>Se cambiamo questa policy, lo comunichiamo nel gioco e aggiorniamo la data in alto.</p>
+
+<h2>15. CONTATTI</h2>
+<p>Privacy e supporto: <a href="mailto:flavio@flavioberti.it">flavio@flavioberti.it</a><br>
+Titolare: Flavio Berti, Santarcangelo di Romagna (RN), Italia</p>
+</section>
 
 <hr>
-<h2>ENGLISH VERSION (for Play Store / AdMob)</h2>
-<p><strong>PRIVACY POLICY - NEXUS CORE (com.nexuscore.game)</strong></p>
-<p>Data collected: nickname, anonymous user ID, game progress (CORE, Gold, Fragments, cards, level, decks), device model for crash logs, Fleet chat messages (if you join a Fleet), ad interactions via Google AdMob (rewarded videos), product IDs for in-app purchases via Google Play Billing.</p>
-<p>Not collected: real name, email (except you contact us), precise GPS location, contacts.</p>
-<p>Storage: local device + Supabase (EU, GDPR compliant).</p>
-<p>Sharing: Supabase hosting only, Google AdMob (ad ID, IP, ad interactions - <a href="https://policies.google.com/privacy">Google Privacy</a>), Google Play Billing (purchase verification only), other players see only nickname, Fleet icon, defense.</p>
-<p>Retention: local until uninstall, cloud 12 months inactivity, Fleet chat 30 days, AdMob per Google policy (up to 14 months).</p>
-<p>Rights (GDPR): access, rectify, delete, portability, object, withdraw ad consent - contact flavio@flavioberti.it</p>
-<p>Children: 7+, no data from &lt;13 without parental consent.</p>
-<p>Security: HTTPS, anonymous auth token, exportable backup, purchases verified by Google Play Billing.</p>
-<p>Ads: App shows optional rewarded videos via Google AdMob. AdMob may use Advertising ID, approximate IP. In EU (Italy) we use UMP to ask consent for personalized ads. You can opt-out in Android Settings > Privacy > Ads > Delete advertising ID. Product "no_ads" removes ads.</p>
-<p>Contact: flavio@flavioberti.it</p>
-<p class="small">Full legally binding version: Italian above. Last update: 6 October 2026.</p>
+
+<!-- ============================== ENGLISH ============================== -->
+<section id="en" lang="en">
+<h1>PRIVACY POLICY - NEXUS CORE</h1>
+<p class="small">Last updated: 20 October 2026<br>App: Nexus Core (com.nexus.game)<br>Valid for Google Play and AdMob</p>
+
+<div class="card">
+<h2>1. DATA CONTROLLER</h2>
+<p><strong>Flavio Berti</strong> - NeonCore Studio<br>
+Email: <a href="mailto:flavio@flavioberti.it">flavio@flavioberti.it</a><br>
+Address: Santarcangelo di Romagna, Emilia-Romagna, Italy<br>
+Privacy contact: flavio@flavioberti.it (subject: "Privacy - Nexus Core")</p>
+</div>
+
+<h2>2. DATA WE COLLECT</h2>
+<ul>
+<li><strong>Player nickname</strong> (chosen by you)</li>
+<li><strong>Anonymous user ID</strong> (generated automatically, not linked to an email or phone number)</li>
+<li><strong>Game data:</strong> CORE, Gold, Fragments, owned cards and fusion levels, level, decks, Dig, Battle and Fleet progress</li>
+<li><strong>Technical data:</strong> device model, OS version, language, anonymous crash logs</li>
+<li><strong>If you join a Fleet:</strong>
+  <ul>
+  <li>Fleet name, emblem, description and code, your rank (Commander, Captain, Pilot)</li>
+  <li>your <strong>war defense</strong> (20 cards with fusion stars) and whether you take part in wars</li>
+  <li>war results: attacks, points, rewards, history, war chest</li>
+  <li>the <strong>Fleet chat messages</strong> you write</li>
+  <li>the <strong>reports</strong> you send (reported message, reporter, reason)</li>
+  <li>the <strong>in-game notices</strong> about you (e.g. "your defense was attacked")</li>
+  </ul>
+</li>
+<li><strong>If you watch rewarded videos:</strong> ad interactions (via Google AdMob)</li>
+<li><strong>If you buy packs:</strong> the purchased product ID (handled by Google Play Billing; we never see card details)</li>
+</ul>
+<p><strong>We do NOT collect:</strong> real name, email (except when you write to us), phone number, precise GPS location, contacts, photos, address book.</p>
+
+<h2>3. HOW WE USE DATA</h2>
+<ul>
+<li>Saving your progress on your device and on the Supabase server (Fleet, wars, backup)</li>
+<li>Matching Fleets for Fleet wars (automatic on Tuesday at 21:00 and Saturday at 15:00 Italian time, lasting 24 hours)</li>
+<li>Showing rankings, war history and trophies</li>
+<li>Running the Fleet chat and its moderation (reports, profanity filter)</li>
+<li>Showing optional rewarded videos via AdMob</li>
+<li>Handling in-app purchases (packs, Gold, Core, ad removal)</li>
+<li>Support and crash fixing</li>
+</ul>
+<p><strong>Legal basis:</strong> performance of a contract (providing the game), legitimate interest (security, moderation and game improvement), consent for personalized ads (UMP in the EU).</p>
+
+<h2>4. FLEET CHAT AND MODERATION</h2>
+<ul>
+<li>Messages are visible only to the members of your Fleet.</li>
+<li>An automatic filter replaces swear words with asterisks before the message is saved.</li>
+<li>You can <strong>report</strong> a message: the report reaches us for review. The Commander and Captains can delete Fleet messages.</li>
+<li>You can <strong>mute</strong> a player: this choice stays only on your device.</li>
+<li>Please don't share personal data in chat (address, phone number, email).</li>
+</ul>
+
+<h2>5. NOTIFICATIONS</h2>
+<p>The game uses <strong>local notifications</strong> scheduled on your device (war start and end, full tickets, rewards). We don't use push notification services or collect notification identifiers. You can turn them off at any time in Android settings.</p>
+
+<h2>6. WHERE DATA IS STORED</h2>
+<ul>
+<li><strong>Local:</strong> on your device (game save, settings, muted players)</li>
+<li><strong>Cloud:</strong> Supabase (EU servers, GDPR compliant): online game data, Fleet, wars, chat and notices</li>
+<li><strong>Backup:</strong> if you export it, a base64 code created by you: you decide where to keep it</li>
+</ul>
+
+<h2>7. SHARING</h2>
+<p>We don't sell data. We only share it with:</p>
+<ul>
+<li><strong>Supabase</strong> (game data hosting) - signed DPA, EU servers - <a href="https://supabase.com/privacy" target="_blank">Privacy</a></li>
+<li><strong>Google AdMob</strong> (optional rewarded videos): Android advertising ID, approximate IP address, ad interactions, device information. Privacy: <a href="https://policies.google.com/privacy" target="_blank">policies.google.com/privacy</a> - Ad technologies: <a href="https://policies.google.com/technologies/ads" target="_blank">policies.google.com/technologies/ads</a>. Opt-out: Android Settings &gt; Privacy &gt; Ads &gt; Delete advertising ID.</li>
+<li><strong>Google Play Billing</strong> (in-app purchases): fully handled by Google; we only receive the purchase confirmation, never card details. Privacy: <a href="https://policies.google.com/privacy" target="_blank">Google Privacy</a></li>
+<li><strong>Google Play Services</strong> (updates and purchases)</li>
+<li><strong>Other players:</strong> can see your nickname, your Fleet (name, emblem, description), your rank, the cards in your war defense, your war points and results, and the messages you write in your Fleet's chat. They never see your ID or email.</li>
+</ul>
+
+<h2>8. RETENTION</h2>
+<ul>
+<li>Local data: until you uninstall the game or delete your save</li>
+<li>Cloud game and Fleet data: as long as your account exists, so you can come back and play even after a long time. You can ask us to delete them at any time (see section 9)</li>
+<li>Fleet chat: 14 days</li>
+<li>In-game notices: 30 days</li>
+<li>Reports: as long as needed for review, at most 12 months</li>
+<li>War history and rewards: as long as your account exists</li>
+<li>AdMob data: per Google's policy (up to 14 months)</li>
+</ul>
+
+<h2>9. ACCOUNT AND DATA DELETION</h2>
+<div class="card">
+<p>To delete your account and <strong>all game data</strong> on our servers, email <a href="mailto:flavio@flavioberti.it?subject=Account%20deletion%20-%20Nexus%20Core">flavio@flavioberti.it</a> with the subject "Account deletion - Nexus Core", stating your <strong>nickname</strong> and, if possible, the name of your Fleet.</p>
+<p>We delete your account, online progress, defenses, war participation, messages and notices <strong>within 30 days</strong> and confirm by email. We may keep only what the law requires (e.g. purchase data handled by Google). Data on your phone is deleted by uninstalling the game.</p>
+</div>
+
+<h2>10. YOUR RIGHTS (GDPR)</h2>
+<p>You have the right to access, rectification, erasure, restriction, portability, objection and withdrawal of consent for ads.</p>
+<p>Write to: <a href="mailto:flavio@flavioberti.it">flavio@flavioberti.it</a> with the subject "GDPR - [your nickname]".<br>
+We reply within 30 days.</p>
+<p>You can also lodge a complaint with the Italian Data Protection Authority (<a href="https://www.garanteprivacy.it" target="_blank">garanteprivacy.it</a>) or your local authority.</p>
+
+<h2>11. CHILDREN</h2>
+<p>The game is rated <strong>7+</strong>. We do not knowingly collect data from children under 13 without parental consent. Fleet chat has an automatic profanity filter, and players can report messages and mute other players. If you are a parent and believe your child has given us data, email flavio@flavioberti.it and we will delete it right away.</p>
+
+<h2>12. SECURITY</h2>
+<ul>
+<li>Encrypted HTTPS/TLS connections</li>
+<li>Anonymous sign-in with a token, no passwords stored in plain text</li>
+<li>Server data protected by access rules: each player can only read and change what belongs to them</li>
+<li>Backup you can export and import yourself (base64): keep it safe, it contains all your progress</li>
+<li>Purchases verified by Google Play Billing (we store no card data)</li>
+</ul>
+
+<h2>13. COOKIES / TRACKING / ADVERTISING</h2>
+<div class="card">
+<p><strong>The app shows optional rewarded videos</strong> via Google AdMob.</p>
+<p>AdMob may use:</p>
+<ul>
+<li>the Android advertising ID to show more relevant ads</li>
+<li>the approximate IP address for general location (e.g. country)</li>
+<li><strong>UMP (User Messaging Platform):</strong> in the EU we show a popup asking for consent to personalized ads, as required by Google. You can choose "Personalized" or "Non-personalized" and change your choice at any time.</li>
+</ul>
+<p><strong>How to turn off personalization:</strong><br>
+Android &gt; Settings &gt; Privacy &gt; Ads &gt; Opt out of ads personalization OR Delete advertising ID</p>
+<p><strong>Ad removal:</strong> the "no_ads" product removes promotional videos.</p>
+<p>No Facebook Pixel. No trackers other than AdMob and Play Billing.</p>
+</div>
+
+<h2>14. CHANGES</h2>
+<p>If we change this policy, we announce it in the game and update the date at the top.</p>
+
+<h2>15. CONTACT</h2>
+<p>Privacy and support: <a href="mailto:flavio@flavioberti.it">flavio@flavioberti.it</a><br>
+Controller: Flavio Berti, Santarcangelo di Romagna (RN), Italy</p>
+<p class="small">In case of differences between the two versions, the Italian version prevails.</p>
+</section>
 
 </body>
 </html>
