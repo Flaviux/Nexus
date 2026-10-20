@@ -1,2028 +1,295 @@
--- =====================================================================
--- NEXUS - CORE WAR  |  SUPABASE PASSO 3: GUERRA TRA FLOTTE (CW)
--- Da lanciare dopo supabase_1_pulizia.sql e supabase_2_sicurezza.sql.
--- Si può rilanciare quando vuoi: non cancella guerre, difese o premi già esistenti.
---
--- PRIMA: Supabase > Database > Extensions > attiva "pg_cron" (serve per far partire le guerre da sole).
---
--- REGOLE (modificabili nella funzione cw_cfg qui sotto):
---   - guerre automatiche martedì 21:00 e sabato 15:00 (ora italiana), durata 24 ore
---   - 60 minuti prima dell'inizio il server abbina le flotte (fase PREPARAZIONE)
---   - partecipa chi ha "PARTECIPO ALLA GUERRA" attivo e una difesa di 20 carte salvata
---   - da 1 contro 1 fino a 15 contro 15; flotte fino a 30 membri
---   - 6 attacchi a testa, massimo 3 nelle prime 12 ore
---   - chi viene sconfitto non è attaccabile per 6 ore
---     (se tutta una flotta è a terra, si rialzano tutti subito, come in Empires & Puzzles)
---   - mentre qualcuno attacca un giocatore, gli altri non possono attaccarlo (20 minuti al massimo)
---   - il Core del difensore RESTA FERITO tra un attacco e l'altro: chi attacca dopo trova il Core
---     con gli HP rimasti. Quando un Core arriva a 0 il difensore è sconfitto, è protetto 6 ore
---     e al termine riparte con il Core pieno (25).
---   - CARTE DISTRUTTE: quando un difensore viene SCONFITTO (Core a 0), le 3 carte più forti che
---     l'attaccante gli ha distrutto in battaglia restano fuori. Il difensore riceve un avviso e può
---     sostituirle con altre sue carte (mai con quelle distrutte). A META' GUERRA (12 ore) c'è la
---     RIPARAZIONE: le carte distrutte tornano disponibili e rientrano da sole negli spazi vuoti.
---     Quelle distrutte nella seconda metà restano fuori fino alla fine.
---   - chi lascia la flotta o viene espulso durante la guerra non può più attaccare (e non prende
---     premi), ma la sua isola resta in guerra: si può attaccare con la difesa che aveva scelto
---   - BAULE DI GUERRA (personale: ogni giocatore ha il suo, si riempie con i risultati della flotta): si riempie guerra dopo guerra. 1 punto per ogni attacco fatto, +4 se la flotta
---     vince, +2 se pareggia. A 50 punti il baule è pronto: CORE, Frammenti, Gold e 3 carte (2 rare +
---     1 epica, con il 15% di probabilità che l'epica diventi leggendaria). I punti in più restano.
---   - controlli anti-trucco: il server non accetta più di 1 danno al Core per ogni secondo di
---     battaglia (gli attacchi "troppo veloci" vengono ridotti e segnati in cw_attacks.flag)
---   - punti attacco: danni fatti al Core in questo attacco + 10 se lo distruggi + 1 ogni 5 HP che ti restano
---   - una flotta senza avversario combatte contro una "Flotta Ombra" (difese copiate da altri giocatori)
---   - ogni carta ha un VALORE (tabella cw_card_values, calcolato da cards.json: ATK, DEF, HP, abilità e rarità);
---     la forza di una difesa = somma dei valori delle 20 carte, +20% per ogni stella di fusione.
---     La calcola il server, non l'app.
---   - abbinamento: prima stesso numero di combattenti, poi forza media più vicina.
---     Se i numeri sono diversi, dalla flotta più grande combattono i giocatori con la forza
---     più vicina a quella degli avversari (non per forza i più forti).
---   - gestione flotta: il Comandante (leader) nomina i Capitani (vice) e passa il comando;
---     Comandante e Capitani espellono; solo il Comandante cambia descrizione e stemma
---   - avvisi (cw_notifications): attacchi subiti, guerra trovata/finita, gradi, espulsioni, nuovi membri
---   - chat di flotta vera (con messaggi di sistema, cancellazione e segnalazioni) e storico delle guerre
---
--- PER PROVARE SUBITO (dall'SQL Editor):
---   select cw_force_round(2);   -- abbina adesso le flotte, la guerra inizia tra 2 minuti
---   select cw_force_end();      -- chiude subito tutte le guerre aperte e assegna i premi
--- =====================================================================
-
--- ---------- 0) pulizia vecchia guerra e missioni di flotta ----------
-do $$
-declare r record;
-begin
-  -- vecchi job automatici della guerra (pg_cron)
-  if to_regclass('cron.job') is not null then
-    for r in execute 'select jobid, command from cron.job' loop
-      if r.command ~* '(war|guerra|matchmaking|fleet_quest|respawn)' and r.command !~* 'cw_tick' then
-        execute format('select cron.unschedule(%s)', r.jobid);
-      end if;
-    end loop;
-  end if;
-  -- vecchie tabelle e viste
-  drop view if exists public.v_flotta_defense_3x3, public.v_flotta_members_full, public.v_war_leaderboard, public.v_war_members_leaderboard cascade;
-  drop table if exists public.war_attacks, public.war_attacks_log, public.war_attacks_new, public.war_chests,
-                       public.war_history, public.war_rewards, public.war_anomalies, public.flotta_defenses,
-                       public.daily_fleet_quests, public.referrals, public.wars cascade;
-  -- vecchie funzioni (tengo solo quelle dei trigger e quelle nuove cw_*)
-  for r in
-    select p.proname, pg_get_function_identity_arguments(p.oid) args
-    from pg_proc p join pg_namespace n on n.oid = p.pronamespace
-    where n.nspname = 'public' and p.prokind = 'f'
-      and p.prorettype not in ('trigger'::regtype, 'event_trigger'::regtype)
-      and p.proname not like 'cw\_%'
-      and not exists (select 1 from pg_depend d where d.objid = p.oid and d.deptype = 'e')
-  loop
-    begin
-      execute format('drop function public.%I(%s)', r.proname, r.args);
-    exception when others then
-      raise notice 'non eliminata %: %', r.proname, sqlerrm;
-    end;
-  end loop;
-end $$;
-
--- ---------- 1) regole ----------
-create or replace function public.cw_cfg(k text) returns int language sql immutable as $$
-  select case k
-    when 'attacks'        then 6    -- attacchi a testa
-    when 'first_half_max' then 3    -- massimo nelle prime 12 ore
-    when 'half_hours'     then 12
-    when 'war_hours'      then 24
-    when 'prep_minutes'   then 60   -- abbinamento prima dell'inizio
-    when 'shield_hours'   then 6    -- protezione dopo una sconfitta
-    when 'lock_minutes'   then 20   -- durata massima di un attacco
-    when 'max_size'       then 15   -- 15 contro 15
-    when 'clan_max'       then 30   -- membri per flotta
-    when 'deck_size'      then 20
-    when 'shadow_points'  then 14   -- punti per attacco della Flotta Ombra
-    when 'min_seconds'    then 20   -- un attacco non può durare meno di così
-    when 'dead_per_attack' then 3   -- carte distrutte al difensore quando viene sconfitto
-    when 'max_dmg_per_sec' then 1   -- anti-trucco: danni al Core al massimo 1 al secondo
-    when 'chest_points'   then 50   -- punti per riempire il baule di guerra
-    when 'chest_win'      then 4    -- punti baule extra se la flotta vince
-    when 'chest_draw'     then 2    -- punti baule extra in caso di pareggio
-  end
-$$;
-
-create or replace function public.cw__ep(t timestamptz) returns bigint language sql immutable as $$
-  select case when t is null then 0 else extract(epoch from t)::bigint end
-$$;
-
--- prossimo inizio guerra dopo p_from: martedì 21:00 o sabato 15:00, ora italiana (gestisce l'ora legale)
-create or replace function public.cw_slot_after(p_from timestamptz) returns timestamptz language plpgsql stable as $$
-declare
-  d date;
-  i int;
-  cand timestamptz;
-begin
-  for i in 0..8 loop
-    d := (p_from at time zone 'Europe/Rome')::date + i;
-    if extract(isodow from d) = 2 then
-      cand := (d + time '21:00') at time zone 'Europe/Rome';
-      if cand > p_from then return cand; end if;
-    elsif extract(isodow from d) = 6 then
-      cand := (d + time '15:00') at time zone 'Europe/Rome';
-      if cand > p_from then return cand; end if;
-    end if;
-  end loop;
-  return null;
-end $$;
-
--- ---------- 2) tabelle ----------
-create table if not exists public.cw_defenses (
-  user_id    text primary key,
-  deck       jsonb not null default '[]',      -- [{"id":"NC_01","stars":2}, ...] 20 carte
-  power      int not null default 0,
-  updated_at timestamptz not null default now()
-);
-
-create table if not exists public.cw_rounds (
-  slot_start timestamptz primary key,
-  created_at timestamptz not null default now(),
-  wars       int not null default 0
-);
-
-create table if not exists public.cw_wars (
-  id         uuid primary key default gen_random_uuid(),
-  slot_start timestamptz,
-  flotta_a   uuid not null,
-  flotta_b   uuid,                              -- vuoto = Flotta Ombra
-  name_a     text,
-  name_b     text,
-  size       int not null,
-  prep_at    timestamptz not null default now(),
-  starts_at  timestamptz not null,
-  ends_at    timestamptz not null,
-  score_a    int not null default 0,
-  score_b    int not null default 0,
-  status     text not null default 'open',      -- open / ended
-  winner     text,                              -- a / b / draw
-  is_shadow  boolean not null default false,
-  created_at timestamptz not null default now()
-);
-create index if not exists cw_wars_open on public.cw_wars(status, ends_at);
-
-create table if not exists public.cw_participants (
-  war_id             uuid not null references public.cw_wars(id) on delete cascade,
-  user_id            text not null,
-  side               text not null check (side in ('a','b')),
-  flotta_id          uuid,
-  player_name        text,
-  deck               jsonb not null default '[]',
-  power              int not null default 0,
-  slot               int not null default 0,
-  attacks_used       int not null default 0,
-  attacks_first_half int not null default 0,
-  points             int not null default 0,
-  defeated_count     int not null default 0,
-  shield_until       timestamptz,
-  is_bot             boolean not null default false,
-  primary key (war_id, user_id)
-);
-create index if not exists cw_participants_user on public.cw_participants(user_id);
-alter table public.cw_participants add column if not exists core_hp int not null default 25;
--- carte distrutte in questa guerra: non tornano nel mazzo fino alla guerra successiva
-alter table public.cw_participants add column if not exists dead jsonb not null default '[]';
--- riparazione di metà guerra già fatta
-alter table public.cw_wars add column if not exists repaired boolean not null default false;
--- attacchi corretti dal controllo anti-trucco
-alter table public.cw_attacks add column if not exists flag text;
-
--- baule di guerra: si riempie guerra dopo guerra
-create table if not exists public.cw_chest (
-  user_id    text primary key,
-  points     int not null default 0,
-  ready      int not null default 0,   -- bauli pieni da aprire
-  opened     int not null default 0,
-  updated_at timestamptz not null default now()
-);
-alter table public.cw_chest enable row level security;
-revoke all on public.cw_chest from anon, authenticated;
-
-create table if not exists public.cw_attacks (
-  id          uuid primary key default gen_random_uuid(),
-  war_id      uuid not null references public.cw_wars(id) on delete cascade,
-  attacker_id text not null,
-  defender_id text not null,
-  started_at  timestamptz not null default now(),
-  finished_at timestamptz,
-  my_hp       int,
-  enemy_hp    int,
-  win         boolean,
-  points      int not null default 0,
-  status      text not null default 'started'   -- started / done / expired
-);
-create index if not exists cw_attacks_open on public.cw_attacks(war_id, defender_id, status);
-
-create table if not exists public.cw_rewards (
-  id         uuid primary key default gen_random_uuid(),
-  war_id     uuid not null references public.cw_wars(id) on delete cascade,
-  user_id    text not null,
-  rank       int,
-  points     int,
-  won        boolean,
-  core       int not null default 0,
-  frammenti  int not null default 0,
-  gold       int not null default 0,
-  claimed    boolean not null default false,
-  created_at timestamptz not null default now(),
-  unique (war_id, user_id)
-);
-
--- avvisi per i giocatori (l'app li legge e li mostra; i più importanti anche come notifica)
-create table if not exists public.cw_notifications (
-  id         bigserial primary key,
-  user_id    text not null,
-  kind       text not null,
-  title      text not null,
-  body       text not null default '',
-  created_at timestamptz not null default now(),
-  read       boolean not null default false
-);
-create index if not exists cw_notifications_user on public.cw_notifications(user_id, id);
-alter table public.cw_notifications add column if not exists msg jsonb;
-
--- segnalazioni dei messaggi in chat (obbligatorie per Google Play con chat tra utenti)
-create table if not exists public.cw_chat_reports (
-  id         bigserial primary key,
-  message_id bigint,
-  flotta_id  uuid,
-  reporter   text,
-  author     text,
-  text       text,
-  reason     text,
-  created_at timestamptz not null default now()
-);
-
--- stemma della flotta e messaggi di sistema in chat
-alter table public.flotte add column if not exists stemma jsonb not null default '{}'::jsonb;
-alter table public.flotta_chat add column if not exists kind text not null default 'user';
--- messaggi tradotti dall'app: modello della frase (in italiano, con {segnaposto}) + dati
-alter table public.flotta_chat add column if not exists msg jsonb;
-create index if not exists flotta_chat_flotta on public.flotta_chat(flotta_id, id);
-
--- valore di ogni carta per il matchmaking (rigenerato da cards.json: se cambi le carte, rilancia lo script)
-create table if not exists public.cw_card_values (
-  id    text primary key,
-  value int not null
-);
-insert into public.cw_card_values(id, value) values
-  ('NC_01', 14),
-  ('NC_02', 14),
-  ('NC_03', 16),
-  ('NC_04', 14),
-  ('NC_05', 14),
-  ('NC_06', 14),
-  ('NC_07', 14),
-  ('NC_08', 14),
-  ('NC_09', 16),
-  ('NC_10', 14),
-  ('NC_11', 14),
-  ('NC_12', 14),
-  ('NC_13', 27),
-  ('NC_14', 22),
-  ('NC_15', 24),
-  ('NC_16', 22),
-  ('NC_17', 27),
-  ('NC_18', 22),
-  ('NC_19', 27),
-  ('NC_20', 22),
-  ('NC_21', 24),
-  ('NC_22', 22),
-  ('NC_23', 27),
-  ('NC_24', 22),
-  ('NC_25', 32),
-  ('NC_26', 30),
-  ('NC_27', 29),
-  ('NC_28', 30),
-  ('NC_29', 32),
-  ('NC_30', 27),
-  ('NC_31', 32),
-  ('NC_32', 30),
-  ('NC_33', 29),
-  ('NC_34', 30),
-  ('NC_35', 32),
-  ('NC_36', 27),
-  ('NC_37', 33),
-  ('NC_38', 32),
-  ('NC_39', 26),
-  ('NC_40', 28),
-  ('NC_41', 35),
-  ('NC_42', 31),
-  ('NC_43', 38),
-  ('NC_44', 40),
-  ('NC_45', 34),
-  ('NC_46', 33),
-  ('NC_47', 48),
-  ('NC_48', 36),
-  ('NC_49', 46),
-  ('NC_50', 45),
-  ('NC_51', 39),
-  ('NC_52', 46),
-  ('NC_53', 53),
-  ('NC_54', 44),
-  ('NC_55', 51),
-  ('NC_56', 50),
-  ('NC_57', 49),
-  ('NC_58', 51),
-  ('NC_59', 53),
-  ('NC_60', 54),
-  ('NC_61', 56),
-  ('NC_62', 54),
-  ('NC_63', 59),
-  ('NC_64', 61),
-  ('NC_65', 63),
-  ('NC_66', 64),
-  ('NC_67', 83),
-  ('NC_68', 68),
-  ('NC_69', 76),
-  ('NC_70', 73),
-  ('NC_71', 81),
-  ('NC_72', 78),
-  ('NC_73', 32),
-  ('NC_74', 31),
-  ('NC_75', 30),
-  ('NC_76', 35),
-  ('NC_77', 43),
-  ('NC_78', 39),
-  ('NC_79', 44),
-  ('NC_80', 51),
-  ('NC_81', 32),
-  ('NC_82', 29),
-  ('NC_83', 32),
-  ('NC_84', 35),
-  ('NC_85', 43),
-  ('NC_86', 39),
-  ('NC_87', 46),
-  ('NC_88', 52),
-  ('NC_89', 29),
-  ('NC_90', 63),
-  ('NC_91', 30),
-  ('NC_92', 29),
-  ('NC_93', 30),
-  ('NC_94', 33),
-  ('NC_95', 38),
-  ('NC_96', 34),
-  ('NC_97', 40),
-  ('NC_98', 46),
-  ('NC_99', 50),
-  ('NC_100', 61),
-  ('NC_101', 27),
-  ('NC_102', 53),
-  ('NC_103', 68),
-  ('NC_104', 62),
-  ('NC_105', 46),
-  ('NC_106', 35),
-  ('NC_107', 26),
-  ('NC_108', 65),
-  ('NC_109', 57),
-  ('NC_110', 46),
-  ('NC_111', 54),
-  ('NC_112', 58),
-  ('NC_113', 25),
-  ('NC_114', 27),
-  ('NC_115', 48),
-  ('NC_116', 19),
-  ('NC_117', 16),
-  ('NC_118', 57),
-  ('NC_119', 40),
-  ('NC_120', 29),
-  ('NC_121', 57),
-  ('NC_122', 57),
-  ('NC_123', 46),
-  ('NC_124', 38),
-  ('NC_125', 76),
-  ('NC_126', 38),
-  ('NC_127', 43),
-  ('NC_128', 27),
-  ('NC_129', 43),
-  ('NC_130', 69),
-  ('NC_131', 37),
-  ('NC_132', 38),
-  ('NC_133', 28),
-  ('NC_134', 41),
-  ('NC_135', 42),
-  ('NC_136', 31),
-  ('NC_137', 36),
-  ('NC_138', 46),
-  ('NC_139', 15),
-  ('NC_140', 32),
-  ('NC_141', 51),
-  ('NC_142', 30),
-  ('NC_143', 27),
-  ('NC_144', 50),
-  ('NC_145', 36),
-  ('NC_146', 47),
-  ('NC_147', 57),
-  ('NC_148', 55),
-  ('NC_149', 50),
-  ('NC_150', 69)
-on conflict (id) do update set value = excluded.value;
-
--- forza di un mazzo: somma dei valori, +20% per stella
-create or replace function public.cw__deck_value(p_deck jsonb) returns int language sql stable as $$
-  select coalesce(round(sum(coalesce(v.value, 30) * (1 + 0.2 * least(greatest(coalesce((e ->> 'stars')::int, 0), 0), 5))))::int, 0)
-  from jsonb_array_elements(case when jsonb_typeof(p_deck) = 'array' then p_deck else '[]'::jsonb end) e
-  left join public.cw_card_values v on v.id = upper(coalesce(e ->> 'id', e #>> '{}'))
-$$;
-
--- tutte le tabelle della guerra si toccano solo dalle funzioni qui sotto
-do $$
-declare t text;
-begin
-  foreach t in array array['cw_defenses','cw_rounds','cw_wars','cw_participants','cw_attacks','cw_rewards','cw_card_values','cw_notifications','cw_chat_reports'] loop
-    execute format('alter table public.%I enable row level security', t);
-    execute format('revoke all on public.%I from anon, authenticated', t);
-  end loop;
-end $$;
-
--- flotte al massimo di 30 membri (sostituisce la regola del passo 2)
-do $$
-begin
-  if to_regclass('public.flotta_members') is not null then
-    drop policy if exists members_insert_self on public.flotta_members;
-    create policy members_insert_self on public.flotta_members for insert to authenticated
-      with check (
-        user_id = auth.uid()::text
-        and exists (select 1 from public.flotte f0 where f0.id = flotta_members.flotta_id)
-        and (role = 'member'
-             or (role = 'leader' and exists (select 1 from public.flotte f
-                                             where f.id = flotta_members.flotta_id and f.created_by = auth.uid()::text)))
-        and not exists (select 1 from public.flotta_members m2
-                        where m2.flotta_id = flotta_members.flotta_id and m2.user_id = auth.uid()::text)
-        and (select count(*) from public.flotta_members m3 where m3.flotta_id = flotta_members.flotta_id) < 30
-      );
-  end if;
-end $$;
-
--- ---------- avvisi e messaggi di sistema (solo server) ----------
--- testo tradotto: t = titolo, b = pezzi del testo, a = dati ({nome} -> valore; quelli con _ davanti si traducono)
-create or replace function public.cw__m(p_t text, p_b jsonb, p_a jsonb default '{}'::jsonb) returns jsonb
-language sql immutable as $$
-  select jsonb_build_object('t', p_t, 'b', coalesce(p_b, '[]'::jsonb), 'a', coalesce(p_a, '{}'::jsonb))
-$$;
-
-drop function if exists public.cw__notify(text, text, text, text);
-create or replace function public.cw__notify(p_user text, p_kind text, p_title text, p_body text, p_msg jsonb default null) returns void
-language sql security definer set search_path = public as $$
-  insert into cw_notifications(user_id, kind, title, body, msg)
-  select p_user, p_kind, p_title, coalesce(p_body, ''), p_msg
-  where p_user is not null and p_user not like 'ombra\_%'
-$$;
-
-drop function if exists public.cw__sysmsg(uuid, text);
-create or replace function public.cw__sysmsg(p_flotta uuid, p_text text, p_msg jsonb default null) returns void
-language sql security definer set search_path = public as $$
-  insert into flotta_chat(flotta_id, uid, sender, text, time, kind, msg)
-  select p_flotta, 'system', 'Flotta', p_text, extract(epoch from now())::bigint, 'system', p_msg
-  where p_flotta is not null
-$$;
-
-create or replace function public.cw__role_name(p_role text) returns text language sql immutable as $$
-  select case p_role when 'leader' then 'Comandante' when 'vice' then 'Capitano' else 'Pilota' end
-$$;
-
-create or replace function public.cw__member_name(p_user text) returns text language sql stable security definer set search_path = public as $$
-  select coalesce((select nullif(player_name_cache, '') from flotta_members where user_id = p_user order by joined_at desc limit 1),
-                  (select nullif(player_name, '') from users where uid = p_user), 'Un giocatore')
-$$;
-
--- nuovo membro: messaggio in chat e avviso a Comandante e Capitani
-create or replace function public.cw__on_member_join() returns trigger
-language plpgsql security definer set search_path = public as $$
-declare
-  r record;
-begin
-  perform cw__sysmsg(new.flotta_id, '👋 ' || coalesce(nullif(new.player_name_cache, ''), 'Un giocatore') || ' è entrato nella flotta',
-    cw__m(null, '["👋 {name} è entrato nella flotta"]', jsonb_build_object('name', coalesce(nullif(new.player_name_cache, ''), 'Player'))));
-  for r in select user_id from flotta_members where flotta_id = new.flotta_id and role in ('leader', 'vice') and user_id <> new.user_id loop
-    perform cw__notify(r.user_id, 'member', 'Nuovo membro', coalesce(nullif(new.player_name_cache, ''), 'Un giocatore') || ' è entrato nella flotta',
-      cw__m('Nuovo membro', '["{name} è entrato nella flotta"]', jsonb_build_object('name', coalesce(nullif(new.player_name_cache, ''), 'Player'))));
-  end loop;
-  return new;
-end $$;
-drop trigger if exists cw_member_join on public.flotta_members;
-create trigger cw_member_join after insert on public.flotta_members for each row execute function public.cw__on_member_join();
-
--- ---------- 3) motore della guerra (solo server) ----------
-
--- abbina le flotte per la guerra che inizia a p_start
-create or replace function public.cw__matchmake(p_start timestamptz) returns int
-language plpgsql security definer set search_path = public as $$
-declare
-  c_max int := cw_cfg('max_size');
-  c_deck int := cw_cfg('deck_size');
-  v_hours int := cw_cfg('war_hours');
-  fl uuid[];
-  nm text[];
-  ns int[];
-  av numeric[];
-  paired boolean[];
-  i int;
-  j int;
-  v_best int;
-  v_small int;
-  v_big int;
-  v_cost numeric;
-  v_len int;
-  v_size int;
-  v_war uuid;
-  v_wars int := 0;
-  p record;
-  v_deck jsonb;
-  v_pow int;
-begin
-  insert into cw_rounds(slot_start) values (p_start) on conflict do nothing;
-  if not found then
-    return 0;
-  end if;
-
-  create temp table if not exists _cw_pool (user_id text, flotta_id uuid, name text, deck jsonb, power int, rn int) on commit drop;
-  truncate _cw_pool;
-  insert into _cw_pool
-  select q.user_id, q.flotta_id, q.name, q.deck, q.power,
-         row_number() over (partition by q.flotta_id order by q.power desc, q.user_id)::int
-  from (
-    select distinct on (m.user_id) m.user_id, m.flotta_id,
-           coalesce(nullif(m.player_name_cache, ''), nullif(u.player_name, ''), 'Player') as name,
-           d.deck, d.power
-    from flotta_members m
-    join flotte f on f.id = m.flotta_id
-    join cw_defenses d on d.user_id = m.user_id
-    left join users u on u.uid = m.user_id
-    where coalesce(m.war_opted, true) and jsonb_array_length(d.deck) = c_deck
-    order by m.user_id, m.joined_at desc
-  ) q
-  where not exists (select 1 from cw_wars w where w.status = 'open'
-                    and (w.flotta_a = q.flotta_id or w.flotta_b = q.flotta_id));
-
-  -- flotte candidate: numero di combattenti (max 15) e forza media dei combattenti
-  select array_agg(x.f order by x.n desc, x.av desc),
-         array_agg(x.nome order by x.n desc, x.av desc),
-         array_agg(x.n order by x.n desc, x.av desc),
-         array_agg(x.av order by x.n desc, x.av desc)
-    into fl, nm, ns, av
-  from (
-    select p2.flotta_id f, coalesce(fo.nome, 'Flotta') nome,
-           least(count(*), c_max)::int n,
-           (sum(case when p2.rn <= c_max then p2.power else 0 end)::numeric / least(count(*), c_max))::numeric av
-    from _cw_pool p2 join flotte fo on fo.id = p2.flotta_id
-    group by p2.flotta_id, fo.nome
-  ) x;
-
-  v_len := coalesce(array_length(fl, 1), 0);
-  paired := array_fill(false, array[greatest(v_len, 1)]);
-  for i in 1..v_len loop
-    if paired[i] then
-      continue;
-    end if;
-    -- avversario migliore: stesso numero prima di tutto, poi forza media più vicina
-    v_best := 0;
-    v_cost := null;
-    for j in (i + 1)..v_len loop
-      if not paired[j] then
-        if v_cost is null or abs(ns[i] - ns[j]) * 1000000 + abs(av[i] - av[j]) < v_cost then
-          v_cost := abs(ns[i] - ns[j]) * 1000000 + abs(av[i] - av[j]);
-          v_best := j;
-        end if;
-      end if;
-    end loop;
-    paired[i] := true;
-    if v_best > 0 then
-      paired[v_best] := true;
-      v_size := least(ns[i], ns[v_best]);
-      insert into cw_wars(slot_start, flotta_a, flotta_b, name_a, name_b, size, prep_at, starts_at, ends_at, is_shadow)
-        values (p_start, fl[i], fl[v_best], nm[i], nm[v_best], v_size, now(), p_start, p_start + make_interval(hours => v_hours), false)
-        returning id into v_war;
-      if ns[i] = ns[v_best] then
-        insert into cw_participants(war_id, user_id, side, flotta_id, player_name, deck, power, slot)
-          select v_war, user_id, 'a', flotta_id, name, deck, power, rn from _cw_pool where flotta_id = fl[i] and rn <= v_size;
-        insert into cw_participants(war_id, user_id, side, flotta_id, player_name, deck, power, slot)
-          select v_war, user_id, 'b', flotta_id, name, deck, power, rn from _cw_pool where flotta_id = fl[v_best] and rn <= v_size;
-      else
-        -- numeri diversi: la flotta piccola schiera tutti; da quella grande scelgo, uno per uno,
-        -- il giocatore con la forza più vicina a ogni avversario (sfide alla pari)
-        v_small := case when ns[i] < ns[v_best] then i else v_best end;
-        v_big := case when v_small = i then v_best else i end;
-        insert into cw_participants(war_id, user_id, side, flotta_id, player_name, deck, power, slot)
-          select v_war, user_id, case when v_small = i then 'a' else 'b' end, flotta_id, name, deck, power, rn
-          from _cw_pool where flotta_id = fl[v_small] and rn <= v_size;
-        for p in select * from _cw_pool where flotta_id = fl[v_small] and rn <= v_size order by power desc loop
-          insert into cw_participants(war_id, user_id, side, flotta_id, player_name, deck, power, slot)
-            select v_war, q.user_id, case when v_big = i then 'a' else 'b' end, q.flotta_id, q.name, q.deck, q.power, p.rn
-            from _cw_pool q
-            where q.flotta_id = fl[v_big]
-              and not exists (select 1 from cw_participants x where x.war_id = v_war and x.user_id = q.user_id)
-            order by abs(q.power - p.power), q.power desc
-            limit 1;
-        end loop;
-      end if;
-      perform cw__war_found(v_war);
-    else
-      -- nessun avversario: Flotta Ombra con difese vere di altri giocatori, di forza simile
-      v_size := ns[i];
-      insert into cw_wars(slot_start, flotta_a, flotta_b, name_a, name_b, size, prep_at, starts_at, ends_at, is_shadow)
-        values (p_start, fl[i], null, nm[i], 'Flotta Ombra', v_size, now(), p_start, p_start + make_interval(hours => v_hours), true)
-        returning id into v_war;
-      insert into cw_participants(war_id, user_id, side, flotta_id, player_name, deck, power, slot)
-        select v_war, user_id, 'a', flotta_id, name, deck, power, rn from _cw_pool where flotta_id = fl[i] and rn <= v_size;
-      for p in select * from _cw_pool where flotta_id = fl[i] and rn <= v_size order by rn loop
-        v_deck := null;
-        v_pow := null;
-        select cd.deck, cd.power into v_deck, v_pow from cw_defenses cd
-          where jsonb_array_length(cd.deck) = c_deck
-            and cd.user_id not in (select user_id from _cw_pool where flotta_id = fl[i])
-          order by abs(cd.power - p.power), random() limit 1;
-        insert into cw_participants(war_id, user_id, side, flotta_id, player_name, deck, power, slot, is_bot)
-          values (v_war, 'ombra_' || p.rn, 'b', null, 'Ombra ' || p.rn,
-                  coalesce(v_deck, p.deck), coalesce(v_pow, p.power), p.rn, true);
-      end loop;
-      perform cw__war_found(v_war);
-    end if;
-    v_wars := v_wars + 1;
-  end loop;
-
-  update cw_rounds set wars = v_wars where slot_start = p_start;
-  return v_wars;
-end $$;
-
--- avvisi di guerra trovata (combattenti) e messaggio in chat alle due flotte
-create or replace function public.cw__war_found(p_war uuid) returns void
-language plpgsql security definer set search_path = public as $$
-declare
-  w cw_wars%rowtype;
-  r record;
-  v_ora text;
-begin
-  select * into w from cw_wars where id = p_war;
-  v_ora := to_char(w.starts_at at time zone 'Europe/Rome', 'HH24:MI');
-  for r in select user_id, side from cw_participants where war_id = p_war and not is_bot loop
-    perform cw__notify(r.user_id, 'war_found', '⚔️ Guerra trovata!',
-      format('Contro %s (%sv%s). Inizia alle %s: controlla la tua difesa.', case when r.side = 'a' then w.name_b else w.name_a end, w.size, w.size, v_ora),
-      cw__m('⚔️ Guerra trovata!', '["Contro {enemy} ({n}v{n}). Inizia alle {time}: controlla la tua difesa."]',
-            jsonb_build_object('enemy', case when r.side = 'a' then w.name_b else w.name_a end, 'n', w.size, 'time', v_ora)));
-  end loop;
-  perform cw__sysmsg(w.flotta_a, format('⚔️ Guerra trovata contro %s (%sv%s). Inizia alle %s.', w.name_b, w.size, w.size, v_ora),
-    cw__m(null, '["⚔️ Guerra trovata contro {enemy} ({n}v{n}). Inizia alle {time}."]', jsonb_build_object('enemy', w.name_b, 'n', w.size, 'time', v_ora)));
-  perform cw__sysmsg(w.flotta_b, format('⚔️ Guerra trovata contro %s (%sv%s). Inizia alle %s.', w.name_a, w.size, w.size, v_ora),
-    cw__m(null, '["⚔️ Guerra trovata contro {enemy} ({n}v{n}). Inizia alle {time}."]', jsonb_build_object('enemy', w.name_a, 'n', w.size, 'time', v_ora)));
-end $$;
-
--- chiude una guerra e prepara i premi
--- aggiunge punti al baule di guerra; quando arriva a 30 il baule è pronto (i punti in più restano)
-create or replace function public.cw__chest_add(p_user text, p_pts int) returns void
-language plpgsql security definer set search_path = public as $$
-declare
-  c cw_chest%rowtype;
-  v_new int := 0;
-begin
-  if p_pts <= 0 then
-    return;
-  end if;
-  insert into cw_chest(user_id) values (p_user) on conflict do nothing;
-  select * into c from cw_chest where user_id = p_user for update;
-  c.points := c.points + p_pts;
-  while c.points >= cw_cfg('chest_points') loop
-    c.points := c.points - cw_cfg('chest_points');
-    c.ready := c.ready + 1;
-    v_new := v_new + 1;
-  end loop;
-  update cw_chest set points = c.points, ready = c.ready, updated_at = now() where user_id = p_user;
-  if v_new > 0 then
-    perform cw__notify(p_user, 'chest', '🧰 Baule di guerra pronto!', 'Il tuo baule di guerra è pieno: aprilo nel Rifugio, scheda GUERRA.',
-      cw__m('🧰 Baule di guerra pronto!', '["Il tuo baule di guerra è pieno: aprilo nel Rifugio, scheda GUERRA."]'));
-  end if;
-end $$;
-
-create or replace function public.cw__end_war(p_war uuid) returns void
-language plpgsql security definer set search_path = public as $$
-declare
-  w cw_wars%rowtype;
-  v_win text;
-  p record;
-begin
-  select * into w from cw_wars where id = p_war for update;
-  if not found or w.status <> 'open' then
-    return;
-  end if;
-  if w.is_shadow then
-    w.score_b := w.size * cw_cfg('attacks') * cw_cfg('shadow_points');
-  end if;
-  v_win := case when w.score_a > w.score_b then 'a' when w.score_b > w.score_a then 'b' else 'draw' end;
-  update cw_wars set status = 'ended', winner = v_win, score_b = w.score_b where id = p_war;
-  update cw_attacks set status = 'expired', finished_at = now() where war_id = p_war and status = 'started';
-
-  -- trofeo alla flotta vincitrice
-  begin
-    if v_win = 'a' then
-      update flotte set war_trophies = coalesce(war_trophies, 0) + 1 where id = w.flotta_a;
-    elsif v_win = 'b' and w.flotta_b is not null then
-      update flotte set war_trophies = coalesce(war_trophies, 0) + 1 where id = w.flotta_b;
-    end if;
-  exception when others then
-    null;
-  end;
-
-  -- premi: solo a chi ha fatto almeno un attacco
-  for p in
-    select cp.*, row_number() over (partition by cp.side order by cp.points desc, cp.attacks_used desc) as rk
-    from cw_participants cp
-    where cp.war_id = p_war and not cp.is_bot and cp.attacks_used > 0
-      and exists (select 1 from flotta_members m where m.user_id = cp.user_id and m.flotta_id = cp.flotta_id)
-  loop
-    insert into cw_rewards(war_id, user_id, rank, points, won, core, frammenti, gold)
-      values (p_war, p.user_id, p.rk, p.points, p.side = v_win,
-              100 + p.attacks_used * 25 + case when p.side = v_win then 300 when v_win = 'draw' then 150 else 0 end,
-              case when p.side = v_win then 3 else 1 end + case when p.rk = 1 then 3 when p.rk <= 3 then 1 else 0 end,
-              case when p.side = v_win then 20 else 5 end)
-      on conflict (war_id, user_id) do nothing;
-    -- baule di guerra: 1 punto ad attacco, + bonus vittoria/pareggio
-    perform cw__chest_add(p.user_id, p.attacks_used
-      + case when p.side = v_win then cw_cfg('chest_win') when v_win = 'draw' then cw_cfg('chest_draw') else 0 end);
-  end loop;
-
-  -- avvisi e chat
-  for p in select cp.user_id, cp.side from cw_participants cp
-           where cp.war_id = p_war and not cp.is_bot
-             and exists (select 1 from flotta_members m where m.user_id = cp.user_id and m.flotta_id = cp.flotta_id) loop
-    perform cw__notify(p.user_id, 'war_end',
-      case when v_win = 'draw' then '🤝 Guerra finita in parità' when p.side = v_win then '🏆 Vittoria!' else '⚔️ Guerra finita: sconfitta' end,
-      format('%s - %s. Ritira i premi nel Rifugio.', case when p.side = 'a' then w.score_a else w.score_b end, case when p.side = 'a' then w.score_b else w.score_a end),
-      cw__m(case when v_win = 'draw' then '🤝 Guerra finita in parità' when p.side = v_win then '🏆 Vittoria!' else '⚔️ Guerra finita: sconfitta' end,
-            '["{a} - {b}. Ritira i premi nel Rifugio."]',
-            jsonb_build_object('a', case when p.side = 'a' then w.score_a else w.score_b end, 'b', case when p.side = 'a' then w.score_b else w.score_a end)));
-  end loop;
-  perform cw__sysmsg(w.flotta_a, format('%s contro %s: %s - %s',
-    case when v_win = 'a' then '🏆 Vittoria' when v_win = 'draw' then '🤝 Pareggio' else '⚔️ Sconfitta' end, w.name_b, w.score_a, w.score_b),
-    cw__m(null, '["{_res} contro {enemy}: {a} - {b}"]', jsonb_build_object('_res', case when v_win = 'a' then '🏆 Vittoria' when v_win = 'draw' then '🤝 Pareggio' else '⚔️ Sconfitta' end,
-                                                                          'enemy', w.name_b, 'a', w.score_a, 'b', w.score_b)));
-  perform cw__sysmsg(w.flotta_b, format('%s contro %s: %s - %s',
-    case when v_win = 'b' then '🏆 Vittoria' when v_win = 'draw' then '🤝 Pareggio' else '⚔️ Sconfitta' end, w.name_a, w.score_b, w.score_a),
-    cw__m(null, '["{_res} contro {enemy}: {a} - {b}"]', jsonb_build_object('_res', case when v_win = 'b' then '🏆 Vittoria' when v_win = 'draw' then '🤝 Pareggio' else '⚔️ Sconfitta' end,
-                                                                          'enemy', w.name_a, 'a', w.score_b, 'b', w.score_a)));
-end $$;
-
--- lanciata dal server ogni 5 minuti
--- è ancora nella flotta con cui è entrato in guerra? (chi esce o viene espulso non attacca più)
-create or replace function public.cw__active(p_war uuid, p_user text) returns boolean
-language sql stable security definer set search_path = public as $$
-  select exists (select 1 from cw_participants cp join flotta_members m
-                   on m.user_id = cp.user_id and m.flotta_id = cp.flotta_id
-                 where cp.war_id = p_war and cp.user_id = p_user)
-$$;
-
--- RIPARAZIONE di metà guerra: le carte distrutte tornano disponibili e riempiono gli spazi vuoti
-create or replace function public.cw__half_repair(p_war uuid) returns void
-language plpgsql security definer set search_path = public as $$
-declare
-  w cw_wars%rowtype;
-  p record;
-  v_deck jsonb;
-  e jsonb;
-begin
-  select * into w from cw_wars where id = p_war for update;
-  if not found or w.repaired or w.status <> 'open'
-     or now() < w.starts_at + make_interval(hours => cw_cfg('half_hours')) then
-    return;
-  end if;
-  update cw_wars set repaired = true where id = p_war;
-  for p in select * from cw_participants where war_id = p_war and jsonb_array_length(dead) > 0 for update loop
-    v_deck := p.deck;
-    for e in select * from jsonb_array_elements(p.dead) loop
-      exit when jsonb_array_length(v_deck) >= cw_cfg('deck_size');
-      if not exists (select 1 from jsonb_array_elements(v_deck) d
-                     where upper(coalesce(d ->> 'id', d #>> '{}')) = upper(coalesce(e ->> 'id', e #>> '{}'))) then
-        v_deck := v_deck || jsonb_build_array(e);
-      end if;
-    end loop;
-    update cw_participants set deck = v_deck, dead = '[]'::jsonb, power = cw__deck_value(v_deck)
-      where war_id = p_war and user_id = p.user_id;
-    if not p.is_bot then
-      perform cw__notify(p.user_id, 'repair', '🔧 Riparazione di metà guerra',
-        format('Le tue carte distrutte sono tornate: la tua difesa ha di nuovo %s/%s carte.',
-               jsonb_array_length(v_deck), cw_cfg('deck_size')),
-        cw__m('🔧 Riparazione di metà guerra', '["Le tue carte distrutte sono tornate: la tua difesa ha di nuovo {n}/{max} carte."]',
-              jsonb_build_object('n', jsonb_array_length(v_deck), 'max', cw_cfg('deck_size'))));
-    end if;
-  end loop;
-end $$;
-
-create or replace function public.cw_tick() returns text
-language plpgsql security definer set search_path = public as $$
-declare
-  w record;
-  s timestamptz;
-  n int := 0;
-  e int := 0;
-begin
-  update cw_attacks set status = 'expired', finished_at = now()
-    where status = 'started' and started_at < now() - make_interval(mins => cw_cfg('lock_minutes'));
-  -- pulizia: chat più vecchia di 14 giorni, avvisi più vecchi di 30
-  delete from flotta_chat where created_at < now() - interval '14 days';
-  delete from cw_notifications where created_at < now() - interval '30 days';
-  delete from cw_chat_reports where created_at < now() - interval '12 months';
-  delete from cw_backups where created_at < now() - interval '30 days';
-  for w in select id from cw_wars where status = 'open' and ends_at <= now() loop
-    perform cw__end_war(w.id);
-    e := e + 1;
-  end loop;
-  for w in select id from cw_wars where status = 'open' and not repaired
-             and now() >= starts_at + make_interval(hours => cw_cfg('half_hours')) loop
-    perform cw__half_repair(w.id);
-  end loop;
-  s := cw_slot_after(now() - interval '30 minutes');
-  if s is not null and now() >= s - make_interval(mins => cw_cfg('prep_minutes')) then
-    n := cw__matchmake(s);
-  end if;
-  return format('guerre chiuse: %s, guerre nuove: %s', e, n);
-end $$;
-
--- PROVA: abbina subito, la guerra inizia tra p_minutes minuti
-create or replace function public.cw_force_round(p_minutes int default 2) returns text
-language plpgsql security definer set search_path = public as $$
-declare
-  s timestamptz := date_trunc('minute', now()) + make_interval(mins => greatest(p_minutes, 0) + 1);
-  n int;
-begin
-  n := cw__matchmake(s);
-  return format('guerre create: %s (inizio %s)', n, s);
-end $$;
-
--- PROVA: chiude subito tutte le guerre aperte
-create or replace function public.cw_force_end() returns text
-language plpgsql security definer set search_path = public as $$
-declare
-  w record;
-  e int := 0;
-begin
-  for w in select id from cw_wars where status = 'open' loop
-    update cw_wars set ends_at = least(ends_at, now()) where id = w.id;
-    perform cw__end_war(w.id);
-    e := e + 1;
-  end loop;
-  return format('guerre chiuse: %s', e);
-end $$;
-
--- ---------- 4) funzioni chiamate dall'app (agiscono sempre e solo per chi ha fatto login) ----------
-
-create or replace function public.cw_my_status() returns jsonb
-language plpgsql security definer set search_path = public as $$
-declare
-  uid text := auth.uid()::text;
-  v_fid uuid;
-  v_fname text;
-  v_role text;
-  v_opted boolean;
-  v_dsize int;
-  v_dpow int;
-  w cw_wars%rowtype;
-  me cw_participants%rowtype;
-  v_my text;
-  v_en text;
-  v_half timestamptz;
-  v_can boolean := false;
-  v_why text := '';
-  res jsonb;
-  v_open jsonb;
-begin
-  if uid is null then
-    return jsonb_build_object('ok', false, 'reason', 'login');
-  end if;
-  select m.flotta_id, coalesce(m.war_opted, true), f.nome, m.role
-    into v_fid, v_opted, v_fname, v_role
-    from flotta_members m left join flotte f on f.id = m.flotta_id
-    where m.user_id = uid order by m.joined_at desc limit 1;
-  select jsonb_array_length(deck), power into v_dsize, v_dpow from cw_defenses where user_id = uid;
-
-  res := jsonb_build_object(
-    'ok', true,
-    'now', cw__ep(now()),
-    'flotta_id', v_fid,
-    'flotta_name', v_fname,
-    'role', v_role,
-    'opted', coalesce(v_opted, false),
-    'defense_cards', coalesce(v_dsize, 0),
-    'defense_power', coalesce(v_dpow, 0),
-    'next_war_at', cw__ep(cw_slot_after(now())),
-    'rules', jsonb_build_object('attacks', cw_cfg('attacks'), 'first_half_max', cw_cfg('first_half_max'),
-                                'half_hours', cw_cfg('half_hours'), 'war_hours', cw_cfg('war_hours'),
-                                'shield_hours', cw_cfg('shield_hours'), 'max_size', cw_cfg('max_size'),
-                                'clan_max', cw_cfg('clan_max'), 'prep_minutes', cw_cfg('prep_minutes'),
-                                'lock_minutes', cw_cfg('lock_minutes'), 'deck_size', cw_cfg('deck_size'),
-                                'dead_per_attack', cw_cfg('dead_per_attack'), 'shadow_points', cw_cfg('shadow_points')),
-    'flotta_stemma', (select stemma from flotte where id = v_fid),
-    'player_name', (select u2.player_name from users u2 where u2.uid = auth.uid()::text),
-    'unread', (select count(*) from cw_notifications where user_id = uid and not read),
-    'chat_last_id', coalesce((select max(id) from flotta_chat where flotta_id = v_fid), 0),
-    'chest', (select jsonb_build_object('points', coalesce(max(c.points), 0), 'need', cw_cfg('chest_points'),
-                                        'ready', coalesce(max(c.ready), 0), 'opened', coalesce(max(c.opened), 0),
-                                        'win', cw_cfg('chest_win'), 'draw', cw_cfg('chest_draw'))
-              from cw_chest c where c.user_id = uid),
-    'rewards', (select jsonb_build_object('count', count(*), 'core', coalesce(sum(core), 0),
-                                          'frammenti', coalesce(sum(frammenti), 0), 'gold', coalesce(sum(gold), 0))
-                from cw_rewards where user_id = uid and not claimed)
-  );
-
-  -- la mia guerra: prima quella in cui combatto, altrimenti quella della mia flotta
-  select w2.* into w from cw_wars w2
-    join cw_participants p on p.war_id = w2.id and p.user_id = uid and p.flotta_id = v_fid
-    where w2.status = 'open' order by w2.starts_at desc limit 1;
-  if not found and v_fid is not null then
-    select * into w from cw_wars where status = 'open' and (flotta_a = v_fid or flotta_b = v_fid)
-      order by starts_at desc limit 1;
-  end if;
-  if w.id is null then
-    return res || jsonb_build_object('war', null);
-  end if;
-
-  if not w.repaired and now() >= w.starts_at + make_interval(hours => cw_cfg('half_hours')) then
-    perform cw__half_repair(w.id);
-    select * into w from cw_wars where id = w.id;
-  end if;
-  select * into me from cw_participants where war_id = w.id and user_id = uid and flotta_id = v_fid;
-  if me.user_id is not null then
-    v_my := me.side;
-  else
-    v_my := case when w.flotta_a = v_fid then 'a' else 'b' end;
-  end if;
-  v_en := case when v_my = 'a' then 'b' else 'a' end;
-  v_half := w.starts_at + make_interval(hours => cw_cfg('half_hours'));
-
-  if me.user_id is null then
-    v_why := 'not_participant';
-  elsif now() < w.starts_at then
-    v_why := 'prep';
-  elsif now() >= w.ends_at then
-    v_why := 'ended';
-  elsif me.attacks_used >= cw_cfg('attacks') then
-    v_why := 'no_attacks';
-  elsif now() < v_half and me.attacks_first_half >= cw_cfg('first_half_max') then
-    v_why := 'half_limit';
-  else
-    v_can := true;
-  end if;
-
-  select jsonb_build_object('id', a.id, 'defender_id', a.defender_id, 'started_at', cw__ep(a.started_at)) into v_open
-    from cw_attacks a where a.war_id = w.id and a.attacker_id = uid and a.status = 'started'
-    order by a.started_at desc limit 1;
-
-  return res || jsonb_build_object(
-    'war', jsonb_build_object(
-      'id', w.id,
-      'phase', case when now() < w.starts_at then 'prep' else 'battle' end,
-      'prep_at', cw__ep(w.prep_at),
-      'starts_at', cw__ep(w.starts_at),
-      'half_at', cw__ep(v_half),
-      'ends_at', cw__ep(w.ends_at),
-      'size', w.size,
-      'is_shadow', w.is_shadow,
-      'my_side', v_my,
-      'my_name', case when v_my = 'a' then w.name_a else w.name_b end,
-      'enemy_name', case when v_my = 'a' then w.name_b else w.name_a end,
-      'my_stemma', (select stemma from flotte where id = case when v_my = 'a' then w.flotta_a else w.flotta_b end),
-      'enemy_stemma', (select stemma from flotte where id = case when v_my = 'a' then w.flotta_b else w.flotta_a end),
-      'my_score', case when v_my = 'a' then w.score_a else w.score_b end,
-      'enemy_score', case when v_my = 'a' then w.score_b else w.score_a end,
-      'repaired', w.repaired
-    ),
-    'me', case when me.user_id is null then null else jsonb_build_object(
-      'attacks_used', me.attacks_used,
-      'attacks_left', greatest(cw_cfg('attacks') - me.attacks_used, 0),
-      'attacks_first_half', me.attacks_first_half,
-      'points', me.points,
-      'can_attack', v_can,
-      'reason', v_why,
-      'deck', me.deck,
-      'dead', me.dead,
-      'core_hp', me.core_hp) end,
-    'reason', v_why,
-    'open_attack', v_open,
-    'allies', (select coalesce(jsonb_agg(jsonb_build_object(
-                  'user_id', p.user_id, 'name', p.player_name, 'power', p.power, 'points', p.points,
-                  'attacks_used', p.attacks_used, 'defeated', p.defeated_count, 'core_hp', p.core_hp,
-                  'shield_until', cw__ep(p.shield_until), 'slot', p.slot, 'deck', p.deck,
-                  'dead_count', jsonb_array_length(p.dead),
-                  'left', not exists (select 1 from flotta_members m where m.user_id = p.user_id and m.flotta_id = p.flotta_id) and not p.is_bot,
-                  'is_me', p.user_id = uid) order by p.slot), '[]'::jsonb)
-               from cw_participants p where p.war_id = w.id and p.side = v_my),
-    'enemies', (select coalesce(jsonb_agg(jsonb_build_object(
-                  'user_id', p.user_id, 'name', p.player_name, 'power', p.power, 'points', p.points,
-                  'defeated', p.defeated_count, 'core_hp', p.core_hp, 'shield_until', cw__ep(p.shield_until), 'slot', p.slot,
-                  'deck', p.deck, 'is_bot', p.is_bot, 'dead_count', jsonb_array_length(p.dead),
-                  'left', not exists (select 1 from flotta_members m where m.user_id = p.user_id and m.flotta_id = p.flotta_id) and not p.is_bot,
-                  'locked', exists (select 1 from cw_attacks a where a.war_id = p.war_id and a.defender_id = p.user_id
-                                    and a.status = 'started' and a.attacker_id <> uid
-                                    and a.started_at > now() - make_interval(mins => cw_cfg('lock_minutes'))))
-                  order by p.slot), '[]'::jsonb)
-                from cw_participants p where p.war_id = w.id and p.side = v_en)
-  );
-end $$;
-
--- salva la difesa (20 carte con le loro stelle). In PREPARAZIONE aggiorna anche quella della guerra.
-create or replace function public.cw_save_defense(p_deck jsonb, p_power int) returns jsonb
-language plpgsql security definer set search_path = public as $$
-declare
-  uid text := auth.uid()::text;
-  e jsonb;
-  clean jsonb := '[]'::jsonb;
-  v_id text;
-  v_st int;
-  v_pow int;
-begin
-  if uid is null then
-    return jsonb_build_object('ok', false, 'reason', 'login');
-  end if;
-  if jsonb_typeof(p_deck) <> 'array' or jsonb_array_length(p_deck) > cw_cfg('deck_size') then
-    return jsonb_build_object('ok', false, 'reason', 'deck');
-  end if;
-  for e in select * from jsonb_array_elements(p_deck) loop
-    if jsonb_typeof(e) = 'string' then
-      v_id := e #>> '{}';
-      v_st := 0;
-    else
-      v_id := e ->> 'id';
-      v_st := coalesce((e ->> 'stars')::int, 0);
-    end if;
-    if v_id is null or v_id !~ '^NC_[A-Za-z0-9_]+$' then
-      return jsonb_build_object('ok', false, 'reason', 'card');
-    end if;
-    clean := clean || jsonb_build_array(jsonb_build_object('id', upper(v_id), 'stars', least(greatest(v_st, 0), 5)));
-  end loop;
-  -- la forza la calcola il server dai valori delle carte (p_power dell'app viene ignorato)
-  v_pow := cw__deck_value(clean);
-  insert into cw_defenses(user_id, deck, power, updated_at)
-    values (uid, clean, v_pow, now())
-    on conflict (user_id) do update set deck = excluded.deck, power = excluded.power, updated_at = now();
-  if jsonb_array_length(clean) = cw_cfg('deck_size') then
-    update cw_participants cp set deck = clean, power = v_pow
-      from cw_wars w
-      where w.id = cp.war_id and cp.user_id = uid and w.status = 'open' and now() < w.starts_at;
-  end if;
-  return jsonb_build_object('ok', true, 'cards', jsonb_array_length(clean), 'power', v_pow);
-end $$;
-
-create or replace function public.cw_set_opted(p_opted boolean) returns jsonb
-language plpgsql security definer set search_path = public as $$
-declare
-  uid text := auth.uid()::text;
-begin
-  if uid is null then
-    return jsonb_build_object('ok', false, 'reason', 'login');
-  end if;
-  update flotta_members set war_opted = coalesce(p_opted, true) where user_id = uid;
-  return jsonb_build_object('ok', found, 'opted', coalesce(p_opted, true));
-end $$;
-
--- inizia un attacco: consuma subito l'attacco (come in Empires & Puzzles) e blocca il difensore
-create or replace function public.cw_start_attack(p_defender text) returns jsonb
-language plpgsql security definer set search_path = public as $$
-declare
-  uid text := auth.uid()::text;
-  w cw_wars%rowtype;
-  me cw_participants%rowtype;
-  df cw_participants%rowtype;
-  v_half timestamptz;
-  v_id uuid;
-begin
-  if uid is null then
-    return jsonb_build_object('ok', false, 'reason', 'login');
-  end if;
-  select w2.* into w from cw_wars w2
-    join cw_participants p on p.war_id = w2.id and p.user_id = uid
-    join flotta_members m on m.user_id = uid and m.flotta_id = p.flotta_id
-    where w2.status = 'open' order by w2.starts_at desc limit 1;
-  if not found then
-    if exists (select 1 from cw_wars w2 join cw_participants p on p.war_id = w2.id and p.user_id = uid where w2.status = 'open') then
-      return jsonb_build_object('ok', false, 'reason', 'left_flotta');
-    end if;
-    return jsonb_build_object('ok', false, 'reason', 'no_war');
-  end if;
-  if now() < w.starts_at then
-    return jsonb_build_object('ok', false, 'reason', 'prep');
-  end if;
-  if now() >= w.ends_at then
-    return jsonb_build_object('ok', false, 'reason', 'ended');
-  end if;
-  select * into me from cw_participants where war_id = w.id and user_id = uid for update;
-  if not cw__active(w.id, uid) then
-    return jsonb_build_object('ok', false, 'reason', 'left_flotta');
-  end if;
-  perform cw__half_repair(w.id);
-  -- un mio attacco rimasto a metà (app chiusa): lo chiudo come perso
-  update cw_attacks set status = 'expired', finished_at = now()
-    where war_id = w.id and attacker_id = uid and status = 'started';
-  v_half := w.starts_at + make_interval(hours => cw_cfg('half_hours'));
-  if me.attacks_used >= cw_cfg('attacks') then
-    return jsonb_build_object('ok', false, 'reason', 'no_attacks');
-  end if;
-  if now() < v_half and me.attacks_first_half >= cw_cfg('first_half_max') then
-    return jsonb_build_object('ok', false, 'reason', 'half_limit', 'half_at', cw__ep(v_half));
-  end if;
-  select * into df from cw_participants where war_id = w.id and user_id = p_defender for update;
-  if not found or df.side = me.side then
-    return jsonb_build_object('ok', false, 'reason', 'target');
-  end if;
-  if df.shield_until is not null and df.shield_until > now() then
-    return jsonb_build_object('ok', false, 'reason', 'shielded', 'shield_until', cw__ep(df.shield_until));
-  end if;
-  if exists (select 1 from cw_attacks a where a.war_id = w.id and a.defender_id = p_defender and a.status = 'started'
-             and a.started_at > now() - make_interval(mins => cw_cfg('lock_minutes'))) then
-    return jsonb_build_object('ok', false, 'reason', 'locked');
-  end if;
-  insert into cw_attacks(war_id, attacker_id, defender_id) values (w.id, uid, p_defender) returning id into v_id;
-  update cw_participants
-    set attacks_used = attacks_used + 1,
-        attacks_first_half = attacks_first_half + case when now() < v_half then 1 else 0 end
-    where war_id = w.id and user_id = uid;
-  return jsonb_build_object('ok', true, 'attack_id', v_id, 'war_id', w.id, 'defender_id', df.user_id,
-                            'defender_name', df.player_name, 'deck', df.deck, 'power', df.power,
-                            'enemy_core', greatest(coalesce(df.core_hp, 25), 1),
-                            'attacks_left', greatest(cw_cfg('attacks') - me.attacks_used - 1, 0));
-end $$;
-
--- fine attacco: il server calcola i punti e toglie le carte distrutte al difensore
-drop function if exists public.cw_finish_attack(uuid, int, int);
-create or replace function public.cw_finish_attack(p_attack uuid, p_my_hp int, p_enemy_hp int, p_dead jsonb default '[]')
-returns jsonb
-language plpgsql security definer set search_path = public as $$
-declare
-  v_left jsonb;
-  v_killed jsonb := '[]'::jsonb;
-  v_secs int;
-  v_flag text;
-  v_kid text;
-  v_idx int;
-  uid text := auth.uid()::text;
-  a cw_attacks%rowtype;
-  w cw_wars%rowtype;
-  v_side text;
-  v_my int := least(greatest(coalesce(p_my_hp, 0), 0), 25);
-  v_en int;
-  v_core int;
-  v_win boolean;
-  v_pts int;
-begin
-  if uid is null then
-    return jsonb_build_object('ok', false, 'reason', 'login');
-  end if;
-  select * into a from cw_attacks where id = p_attack and attacker_id = uid for update;
-  if not found then
-    return jsonb_build_object('ok', false, 'reason', 'not_found');
-  end if;
-  if a.status <> 'started' then
-    return jsonb_build_object('ok', false, 'reason', 'expired');
-  end if;
-  if now() < a.started_at + make_interval(secs => cw_cfg('min_seconds')) then
-    return jsonb_build_object('ok', false, 'reason', 'too_fast');
-  end if;
-  select * into w from cw_wars where id = a.war_id for update;
-  if w.status <> 'open' then
-    update cw_attacks set status = 'expired', finished_at = now() where id = a.id;
-    return jsonb_build_object('ok', false, 'reason', 'ended');
-  end if;
-  -- il Core del difensore all'inizio di questo attacco (può essere già ferito)
-  select greatest(coalesce(core_hp, 25), 1) into v_core from cw_participants
-    where war_id = a.war_id and user_id = a.defender_id for update;
-  v_core := coalesce(v_core, 25);
-  v_en := least(greatest(coalesce(p_enemy_hp, v_core), 0), v_core);
-  -- anti-trucco: non più di 1 danno al Core per ogni secondo di battaglia
-  v_secs := greatest(extract(epoch from (now() - a.started_at))::int, 0);
-  if v_core - v_en > v_secs * cw_cfg('max_dmg_per_sec') then
-    v_flag := format('danni %s in %s secondi', v_core - v_en, v_secs);
-    v_en := greatest(v_core - v_secs * cw_cfg('max_dmg_per_sec'), 0);
-  end if;
-  v_win := (v_en = 0 and v_my > 0);
-  if v_en = 0 and not v_win then
-    v_en := 1;   -- pareggio a 0-0: il Core resta in piedi con 1 HP
-  end if;
-  v_pts := (v_core - v_en) + case when v_win then 10 + v_my / 5 else 0 end;
-
-  -- carte distrutte: solo se il difensore è SCONFITTO. Le più forti tra quelle uccise in battaglia,
-  -- al massimo 3, solo se erano nel suo mazzo
-  select deck into v_left from cw_participants where war_id = a.war_id and user_id = a.defender_id;
-  v_left := coalesce(v_left, '[]'::jsonb);
-  for v_kid in
-    select upper(coalesce(x ->> 'id', x #>> '{}'))
-    from jsonb_array_elements(case when v_win and jsonb_typeof(p_dead) = 'array' then p_dead else '[]'::jsonb end) x
-    left join cw_card_values cv on cv.id = upper(coalesce(x ->> 'id', x #>> '{}'))
-    order by coalesce(cv.value, 0) desc
-  loop
-    exit when jsonb_array_length(v_killed) >= cw_cfg('dead_per_attack');
-    select (t.o - 1)::int into v_idx
-      from jsonb_array_elements(v_left) with ordinality t(e, o)
-      where upper(coalesce(t.e ->> 'id', t.e #>> '{}')) = v_kid limit 1;
-    if v_idx is not null then
-      v_killed := v_killed || jsonb_build_array(v_left -> v_idx);
-      v_left := v_left - v_idx;
-    end if;
-    v_idx := null;
-  end loop;
-  if jsonb_array_length(v_killed) > 0 then
-    update cw_participants set deck = v_left, dead = dead || v_killed, power = cw__deck_value(v_left)
-      where war_id = a.war_id and user_id = a.defender_id;
-  end if;
-
-  update cw_attacks set status = 'done', finished_at = now(), my_hp = v_my, enemy_hp = v_en, win = v_win, points = v_pts,
-                        flag = v_flag
-    where id = a.id;
-  update cw_participants set points = points + v_pts where war_id = a.war_id and user_id = uid returning side into v_side;
-  if v_side = 'a' then
-    update cw_wars set score_a = score_a + v_pts where id = a.war_id;
-  else
-    update cw_wars set score_b = score_b + v_pts where id = a.war_id;
-  end if;
-
-  if v_win then
-    -- sconfitto: protetto 6 ore e Core di nuovo pieno quando torna in gioco
-    update cw_participants
-      set shield_until = now() + make_interval(hours => cw_cfg('shield_hours')), defeated_count = defeated_count + 1, core_hp = 25
-      where war_id = a.war_id and user_id = a.defender_id;
-    -- tutta la flotta avversaria a terra: si rialzano tutti subito
-    if not exists (select 1 from cw_participants
-                   where war_id = a.war_id and side <> v_side and (shield_until is null or shield_until <= now())) then
-      update cw_participants set shield_until = null, core_hp = 25 where war_id = a.war_id and side <> v_side;
-    end if;
-  else
-    -- non distrutto: il Core resta ferito per il prossimo attaccante
-    update cw_participants set core_hp = v_en where war_id = a.war_id and user_id = a.defender_id;
-  end if;
-
-  perform cw__notify(a.defender_id, 'attacked',
-    case when v_win then '🛡️ La tua difesa è caduta' else '🛡️ La tua difesa ha resistito' end,
-    format('%s ti ha attaccato (%s punti per loro).%s%s', cw__member_name(uid), v_pts,
-           case when v_win then format(' Sei protetto per %s ore.', cw_cfg('shield_hours'))
-                else format(' Il tuo Core è a %s/25.', v_en) end,
-           case when jsonb_array_length(v_killed) = 1
-                  then ' 💀 Ti ha distrutto 1 carta: sostituiscila nella mappa della guerra per tornare a 20.'
-                       || case when not w.repaired then ' A metà guerra torna da sola.' else '' end
-                when jsonb_array_length(v_killed) > 1
-                  then format(' 💀 Ti ha distrutto %s carte: sostituiscile nella mappa della guerra per tornare a 20.', jsonb_array_length(v_killed))
-                       || case when not w.repaired then ' A metà guerra tornano da sole.' else '' end
-                else '' end),
-    cw__m(case when v_win then '🛡️ La tua difesa è caduta' else '🛡️ La tua difesa ha resistito' end,
-          jsonb_build_array('{name} ti ha attaccato ({pts} punti per loro).')
-          || jsonb_build_array(case when v_win then ' Sei protetto per {h} ore.' else ' Il tuo Core è a {core}/25.' end)
-          || case when jsonb_array_length(v_killed) = 1
-                  then jsonb_build_array(' 💀 Ti ha distrutto 1 carta: sostituiscila nella mappa della guerra per tornare a 20.')
-                       || case when not w.repaired then jsonb_build_array(' A metà guerra torna da sola.') else '[]'::jsonb end
-                  when jsonb_array_length(v_killed) > 1
-                  then jsonb_build_array(' 💀 Ti ha distrutto {dead} carte: sostituiscile nella mappa della guerra per tornare a 20.')
-                       || case when not w.repaired then jsonb_build_array(' A metà guerra tornano da sole.') else '[]'::jsonb end
-                  else '[]'::jsonb end,
-          jsonb_build_object('name', cw__member_name(uid), 'pts', v_pts, 'h', cw_cfg('shield_hours'), 'core', v_en,
-                             'dead', jsonb_array_length(v_killed))));
-  select * into w from cw_wars where id = a.war_id;
-  return jsonb_build_object('ok', true, 'points', v_pts, 'win', v_win, 'enemy_core_left', case when v_win then 0 else v_en end,
-                            'killed', v_killed,
-                            'my_score', case when v_side = 'a' then w.score_a else w.score_b end,
-                            'enemy_score', case when v_side = 'a' then w.score_b else w.score_a end);
-end $$;
-
--- sostituisce le carte distrutte con altre carte (mai quelle distrutte, mai doppioni) fino a 20
-create or replace function public.cw_replace_dead(p_cards jsonb) returns jsonb
-language plpgsql security definer set search_path = public as $$
-declare
-  uid text := auth.uid()::text;
-  me cw_participants%rowtype;
-  e jsonb;
-  v_id text;
-  v_st int;
-  v_deck jsonb;
-  v_free int;
-  v_added int := 0;
-begin
-  if uid is null then
-    return jsonb_build_object('ok', false, 'reason', 'login');
-  end if;
-  select cp.* into me from cw_participants cp join cw_wars w on w.id = cp.war_id
-    where cp.user_id = uid and w.status = 'open' and now() < w.ends_at
-    order by w.starts_at desc limit 1 for update of cp;
-  if me.user_id is null then
-    return jsonb_build_object('ok', false, 'reason', 'no_war');
-  end if;
-  if jsonb_typeof(p_cards) <> 'array' then
-    return jsonb_build_object('ok', false, 'reason', 'card');
-  end if;
-  v_deck := me.deck;
-  v_free := cw_cfg('deck_size') - jsonb_array_length(v_deck);
-  if v_free <= 0 then
-    return jsonb_build_object('ok', false, 'reason', 'full');
-  end if;
-  if jsonb_array_length(p_cards) > v_free then
-    return jsonb_build_object('ok', false, 'reason', 'too_many');
-  end if;
-  for e in select * from jsonb_array_elements(p_cards) loop
-    if jsonb_typeof(e) = 'string' then
-      v_id := e #>> '{}';
-      v_st := 0;
-    else
-      v_id := e ->> 'id';
-      v_st := coalesce((e ->> 'stars')::int, 0);
-    end if;
-    if v_id is null or v_id !~ '^NC_[A-Za-z0-9_]+$' then
-      return jsonb_build_object('ok', false, 'reason', 'card');
-    end if;
-    v_id := upper(v_id);
-    if exists (select 1 from jsonb_array_elements(me.dead) d where upper(coalesce(d ->> 'id', d #>> '{}')) = v_id) then
-      return jsonb_build_object('ok', false, 'reason', 'dead_card', 'card', v_id);
-    end if;
-    if exists (select 1 from jsonb_array_elements(v_deck) d where upper(coalesce(d ->> 'id', d #>> '{}')) = v_id) then
-      return jsonb_build_object('ok', false, 'reason', 'in_deck', 'card', v_id);
-    end if;
-    v_deck := v_deck || jsonb_build_array(jsonb_build_object('id', v_id, 'stars', least(greatest(v_st, 0), 5)));
-    v_added := v_added + 1;
-  end loop;
-  update cw_participants set deck = v_deck, power = cw__deck_value(v_deck)
-    where war_id = me.war_id and user_id = uid;
-  return jsonb_build_object('ok', true, 'added', v_added, 'cards', jsonb_array_length(v_deck), 'power', cw__deck_value(v_deck));
-exception when invalid_text_representation then
-  return jsonb_build_object('ok', false, 'reason', 'card');
-end $$;
-
--- apre un baule di guerra pieno. Il server decide il premio; le carte (rarità) le sceglie l'app dal catalogo.
-create or replace function public.cw_open_chest() returns jsonb
-language plpgsql security definer set search_path = public as $$
-declare
-  uid text := auth.uid()::text;
-  c cw_chest%rowtype;
-  v_cards jsonb;
-begin
-  if uid is null then
-    return jsonb_build_object('ok', false, 'reason', 'login');
-  end if;
-  select * into c from cw_chest where user_id = uid for update;
-  if not found or c.ready <= 0 then
-    return jsonb_build_object('ok', false, 'reason', 'chest_empty');
-  end if;
-  update cw_chest set ready = ready - 1, opened = opened + 1, updated_at = now() where user_id = uid;
-  v_cards := jsonb_build_array('rara', 'rara', case when random() < 0.15 then 'leggendaria' else 'epica' end);
-  return jsonb_build_object('ok', true, 'core', 1500, 'frammenti', 12, 'gold', 80, 'cards', v_cards,
-                            'ready_left', c.ready - 1, 'points', c.points, 'need', cw_cfg('chest_points'));
-end $$;
-
--- riscatta i premi delle guerre finite
-create or replace function public.cw_claim_rewards() returns jsonb
-language plpgsql security definer set search_path = public as $$
-declare
-  uid text := auth.uid()::text;
-  r jsonb;
-begin
-  if uid is null then
-    return jsonb_build_object('ok', false, 'reason', 'login');
-  end if;
-  with c as (
-    update cw_rewards set claimed = true where user_id = uid and not claimed
-    returning core, frammenti, gold, won, rank, points
-  )
-  select jsonb_build_object('ok', true, 'count', count(*), 'core', coalesce(sum(core), 0),
-                            'frammenti', coalesce(sum(frammenti), 0), 'gold', coalesce(sum(gold), 0),
-                            'won', coalesce(bool_or(won), false), 'best_rank', coalesce(min(rank), 0),
-                            'points', coalesce(sum(points), 0))
-    into r from c;
-  return r;
-end $$;
-
--- esci dalla flotta (anche sul server). Se esce il leader, passa a un vice (o al membro più vecchio).
-create or replace function public.cw_leave_flotta() returns jsonb
-language plpgsql security definer set search_path = public as $$
-declare
-  uid text := auth.uid()::text;
-  r record;
-  v_next text;
-begin
-  if uid is null then
-    return jsonb_build_object('ok', false, 'reason', 'login');
-  end if;
-  for r in select flotta_id, role from flotta_members where user_id = uid loop
-    perform cw__sysmsg(r.flotta_id, '🚪 ' || cw__member_name(uid) || ' ha lasciato la flotta',
-      cw__m(null, '["🚪 {name} ha lasciato la flotta"]', jsonb_build_object('name', cw__member_name(uid))));
-    delete from flotta_members where user_id = uid and flotta_id = r.flotta_id;
-    if r.role = 'leader' then
-      select user_id into v_next from flotta_members where flotta_id = r.flotta_id order by (role = 'vice') desc, joined_at limit 1;
-      if v_next is null then
-        begin
-          delete from flotte where id = r.flotta_id
-            and not exists (select 1 from cw_wars w where w.status = 'open' and (w.flotta_a = r.flotta_id or w.flotta_b = r.flotta_id));
-        exception when others then
-          null;
-        end;
-      else
-        update flotta_members set role = 'leader' where flotta_id = r.flotta_id and user_id = v_next;
-        update flotte set created_by = v_next where id = r.flotta_id;
-        perform cw__notify(v_next, 'role', 'Sei il nuovo Comandante', 'Il comandante ha lasciato la flotta: ora la guidi tu.',
-          cw__m('Sei il nuovo Comandante', '["Il comandante ha lasciato la flotta: ora la guidi tu."]'));
-        perform cw__sysmsg(r.flotta_id, '👑 ' || cw__member_name(v_next) || ' è il nuovo Comandante',
-          cw__m(null, '["👑 {name} è il nuovo Comandante"]', jsonb_build_object('name', cw__member_name(v_next))));
-      end if;
-    end if;
-  end loop;
-  return jsonb_build_object('ok', true);
-end $$;
-
--- ---------- gestione membri ----------
--- elenco membri di una flotta (la mia se p_flotta è vuoto): nome, grado, forza difesa, guerra sì/no
-create or replace function public.cw_flotta_members(p_flotta uuid default null) returns jsonb
-language plpgsql security definer set search_path = public as $$
-declare
-  v_uid text := auth.uid()::text;
-  v_fid uuid := p_flotta;
-  v_my_role text;
-begin
-  if v_uid is null then
-    return jsonb_build_object('ok', false, 'reason', 'login');
-  end if;
-  if v_fid is null then
-    select flotta_id into v_fid from flotta_members where user_id = v_uid order by joined_at desc limit 1;
-  end if;
-  if v_fid is null then
-    return jsonb_build_object('ok', true, 'members', '[]'::jsonb, 'my_role', null);
-  end if;
-  select role into v_my_role from flotta_members where user_id = v_uid and flotta_id = v_fid;
-  return jsonb_build_object('ok', true, 'flotta_id', v_fid, 'my_role', v_my_role,
-    'flotta', (select jsonb_build_object('nome', f.nome, 'descrizione', coalesce(f.descrizione, ''), 'stemma', f.stemma,
-                                         'codice', coalesce(f.codice_invito, ''), 'trofei', coalesce(f.war_trophies, 0),
-                                         'created_at', cw__ep(f.created_at))
-               from flotte f where f.id = v_fid),
-    'members', (select coalesce(jsonb_agg(jsonb_build_object(
-        'user_id', m.user_id,
-        'name', coalesce(nullif(m.player_name_cache, ''), nullif(u.player_name, ''), 'Player'),
-        'role', coalesce(m.role, 'member'),
-        'war_opted', coalesce(m.war_opted, true),
-        'power', coalesce(d.power, 0),
-        'defense_cards', coalesce(jsonb_array_length(d.deck), 0),
-        'joined_at', cw__ep(m.joined_at),
-        'is_me', m.user_id = v_uid)
-      order by case coalesce(m.role, 'member') when 'leader' then 0 when 'vice' then 1 else 2 end, coalesce(d.power, 0) desc), '[]'::jsonb)
-      from flotta_members m
-      left join users u on u.uid = m.user_id
-      left join cw_defenses d on d.user_id = m.user_id
-      where m.flotta_id = v_fid));
-end $$;
-
--- difesa di un giocatore (per vedere le sue carte migliori)
-create or replace function public.cw_member_cards(p_user text) returns jsonb
-language plpgsql security definer set search_path = public as $$
-declare
-  uid text := auth.uid()::text;
-  r cw_defenses%rowtype;
-begin
-  if uid is null then
-    return jsonb_build_object('ok', false, 'reason', 'login');
-  end if;
-  select * into r from cw_defenses where user_id = p_user;
-  if not found then
-    return jsonb_build_object('ok', true, 'deck', '[]'::jsonb, 'power', 0);
-  end if;
-  return jsonb_build_object('ok', true, 'deck', r.deck, 'power', r.power);
-end $$;
-
--- cambia grado: solo il leader. 'vice' / 'member' / 'leader' (passa il comando: il vecchio leader diventa vice)
-create or replace function public.cw_set_role(p_user text, p_role text) returns jsonb
-language plpgsql security definer set search_path = public as $$
-declare
-  uid text := auth.uid()::text;
-  v_fid uuid;
-  v_target_role text;
-begin
-  if uid is null then
-    return jsonb_build_object('ok', false, 'reason', 'login');
-  end if;
-  if p_role not in ('vice', 'member', 'leader') then
-    return jsonb_build_object('ok', false, 'reason', 'role');
-  end if;
-  select flotta_id into v_fid from flotta_members where user_id = uid and role = 'leader' order by joined_at desc limit 1;
-  if v_fid is null then
-    return jsonb_build_object('ok', false, 'reason', 'not_leader');
-  end if;
-  select role into v_target_role from flotta_members where user_id = p_user and flotta_id = v_fid;
-  if v_target_role is null or p_user = uid then
-    return jsonb_build_object('ok', false, 'reason', 'target');
-  end if;
-  if p_role = 'leader' then
-    update flotta_members set role = 'vice' where user_id = uid and flotta_id = v_fid;
-    update flotta_members set role = 'leader' where user_id = p_user and flotta_id = v_fid;
-    update flotte set created_by = p_user where id = v_fid;
-  else
-    update flotta_members set role = p_role where user_id = p_user and flotta_id = v_fid;
-  end if;
-  perform cw__notify(p_user, 'role', 'Nuovo grado: ' || cw__role_name(p_role), 'Il comandante ti ha nominato ' || cw__role_name(p_role) || '.',
-    cw__m('Nuovo grado: {_role}', '["Il comandante ti ha nominato {_role}."]', jsonb_build_object('_role', cw__role_name(p_role))));
-  perform cw__sysmsg(v_fid, '⭐ ' || cw__member_name(p_user) || ' ora è ' || cw__role_name(p_role),
-    cw__m(null, '["⭐ {name} ora è {_role}"]', jsonb_build_object('name', cw__member_name(p_user), '_role', cw__role_name(p_role))));
-  return jsonb_build_object('ok', true, 'role', p_role);
-end $$;
-
--- espelli: il leader espelle chiunque, il vice solo i membri semplici
-create or replace function public.cw_kick(p_user text) returns jsonb
-language plpgsql security definer set search_path = public as $$
-declare
-  uid text := auth.uid()::text;
-  v_fid uuid;
-  v_my_role text;
-  v_target_role text;
-begin
-  if uid is null then
-    return jsonb_build_object('ok', false, 'reason', 'login');
-  end if;
-  select flotta_id, role into v_fid, v_my_role from flotta_members
-    where user_id = uid and role in ('leader', 'vice') order by joined_at desc limit 1;
-  if v_fid is null then
-    return jsonb_build_object('ok', false, 'reason', 'not_leader');
-  end if;
-  select role into v_target_role from flotta_members where user_id = p_user and flotta_id = v_fid;
-  if v_target_role is null or p_user = uid or v_target_role = 'leader'
-     or (v_my_role = 'vice' and v_target_role <> 'member') then
-    return jsonb_build_object('ok', false, 'reason', 'target');
-  end if;
-  perform cw__sysmsg(v_fid, '🚪 ' || cw__member_name(p_user) || ' è stato espulso dalla flotta',
-    cw__m(null, '["🚪 {name} è stato espulso dalla flotta"]', jsonb_build_object('name', cw__member_name(p_user))));
-  perform cw__notify(p_user, 'kicked', 'Sei stato espulso', 'Non fai più parte della flotta ' || coalesce((select nome from flotte where id = v_fid), '') || '.',
-    cw__m('Sei stato espulso', '["Non fai più parte della flotta {fleet}."]', jsonb_build_object('fleet', coalesce((select nome from flotte where id = v_fid), ''))));
-  delete from flotta_members where user_id = p_user and flotta_id = v_fid;
-  return jsonb_build_object('ok', true);
-end $$;
-
--- ---------- avvisi ----------
-create or replace function public.cw_notifications_list() returns jsonb
-language plpgsql security definer set search_path = public as $$
-declare
-  v_uid text := auth.uid()::text;
-begin
-  if v_uid is null then
-    return jsonb_build_object('ok', false, 'reason', 'login');
-  end if;
-  return jsonb_build_object('ok', true,
-    'unread', (select count(*) from cw_notifications where user_id = v_uid and not read),
-    'items', (select coalesce(jsonb_agg(jsonb_build_object('id', n.id, 'kind', n.kind, 'title', n.title, 'body', n.body, 'msg', n.msg,
-                                                           'at', cw__ep(n.created_at), 'read', n.read) order by n.id desc), '[]'::jsonb)
-              from (select * from cw_notifications where user_id = v_uid order by id desc limit 40) n));
-end $$;
-
-create or replace function public.cw_notifications_read(p_upto bigint default null) returns jsonb
-language plpgsql security definer set search_path = public as $$
-declare
-  v_uid text := auth.uid()::text;
-begin
-  if v_uid is null then
-    return jsonb_build_object('ok', false, 'reason', 'login');
-  end if;
-  update cw_notifications set read = true where user_id = v_uid and not read and (p_upto is null or id <= p_upto);
-  return jsonb_build_object('ok', true);
-end $$;
-
--- ---------- chat di flotta ----------
-create or replace function public.cw_chat_list(p_after bigint default 0) returns jsonb
-language plpgsql security definer set search_path = public as $$
-declare
-  v_uid text := auth.uid()::text;
-  v_fid uuid;
-  v_role text;
-begin
-  if v_uid is null then
-    return jsonb_build_object('ok', false, 'reason', 'login');
-  end if;
-  select flotta_id, role into v_fid, v_role from flotta_members where user_id = v_uid order by joined_at desc limit 1;
-  if v_fid is null then
-    return jsonb_build_object('ok', false, 'reason', 'no_flotta');
-  end if;
-  return jsonb_build_object('ok', true, 'my_role', v_role,
-    'messages', (select coalesce(jsonb_agg(jsonb_build_object('id', c.id, 'uid', c.uid, 'sender', c.sender, 'text', c.text, 'msg', c.msg,
-                                                              'kind', coalesce(c.kind, 'user'), 'at', cw__ep(c.created_at),
-                                                              'is_me', c.uid = v_uid) order by c.id), '[]'::jsonb)
-                 from (select * from flotta_chat where flotta_id = v_fid and id > coalesce(p_after, 0)
-                       order by id desc limit 60) c));
-end $$;
-
--- ---------- filtro parolacce della chat ----------
--- (usato anche per i nomi dei giocatori e le descrizioni delle flotte)
--- ogni riga è un'espressione regolare (senza maiuscole/minuscole). Puoi aggiungerne altre:
---   insert into cw_badwords(pattern) values ('parola');
--- \m e \M = inizio e fine parola (così "peacock" o "scopa" non vengono toccate)
-create table if not exists public.cw_badwords (
-  pattern text primary key
-);
-alter table public.cw_badwords enable row level security;
-revoke all on public.cw_badwords from anon, authenticated;
-insert into public.cw_badwords(pattern) values
-  -- italiano
-  ('cazz\w*'), ('vaffancul\w*'), ('fancul\w*'), ('stronz\w*'), ('coglion\w*'), ('puttan\w*'),
-  ('mignott\w*'), ('zoccol\w*'), ('\mmerd\w*'), ('\mtroi[ae]\M'), ('\mbastard[oaie]\M'), ('minchi\w*'),
-  ('\mfottut\w*'), ('\mfott(i|ere|ete|o|uto)\M'), ('\mculo\M'), ('\mculi\M'), ('\mfiga\M'), ('\mfrocio\M'), ('\mfroci\M'),
-  ('ricchion\w*'), ('\mpompin\w*'), ('\mnegr[oaie]\M'), ('\mporc[oa]\s*(dio|madonna|puttana|troia)\M'),
-  ('\mdio\s*(cane|porco|maiale|bestia|boia|ladro|merda)\M'), ('\mmadonna\s*(puttana|troia|maiala|zoccola)\M'),
-  ('\mtesta\s*di\s*cazzo\M'), ('\msucchiacazz\w*'), ('\mleccaculo\M'),
-  -- inglese
-  ('fuck\w*'), ('\mf+u+c+k+\w*'), ('shit\w*'), ('bitch\w*'), ('cunt\w*'), ('asshole\w*'), ('\mdick(s|head)?\M'),
-  ('\mcocks?\M'), ('\mpuss(y|ies)\M'), ('\mwhores?\M'), ('\msluts?\M'), ('fagg?ots?'), ('nigg\w*'), ('\mretard\w*'),
-  ('\mbastards?\M'), ('\mwank\w*'), ('motherf\w*')
-on conflict do nothing;
-
--- sostituisce le parolacce con asterischi (stessa lunghezza)
-create or replace function public.cw__clean(p_text text) returns text
-language plpgsql stable security definer set search_path = public as $$
-declare
-  v text := coalesce(p_text, '');
-  r record;
-  m text[];
-begin
-  for r in select pattern from cw_badwords loop
-    begin
-      for m in select regexp_matches(v, '(' || r.pattern || ')', 'gi') loop
-        if m[1] is not null and length(m[1]) > 0 then
-          v := replace(v, m[1], repeat('*', length(m[1])));
-        end if;
-      end loop;
-    exception when others then
-      null;   -- espressione scritta male: la salto
-    end;
-  end loop;
-  return v;
-end $$;
-
--- cambia il nome del giocatore ovunque: profilo, flotta e guerre in corso
-create or replace function public.cw_set_name(p_name text) returns jsonb
-language plpgsql security definer set search_path = public as $$
-declare
-  v_uid text := auth.uid()::text;
-  v text := btrim(coalesce(p_name, ''));
-begin
-  if v_uid is null then
-    return jsonb_build_object('ok', false, 'reason', 'login');
-  end if;
-  if v !~ '^[A-Za-z0-9_]{3,16}$' then
-    return jsonb_build_object('ok', false, 'reason', 'name');
-  end if;
-  if cw__clean(v) <> v then
-    return jsonb_build_object('ok', false, 'reason', 'name_bad');
-  end if;
-  begin
-    update users set player_name = v where users.uid = v_uid;
-    if not found then
-      insert into users(uid, player_name, is_guest) values (v_uid, v, true);
-    end if;
-  exception when unique_violation then
-    return jsonb_build_object('ok', false, 'reason', 'name_taken');
-  end;
-  update flotta_members set player_name_cache = v where user_id = v_uid;
-  update cw_participants cp set player_name = v
-    from cw_wars w where w.id = cp.war_id and w.status = 'open' and cp.user_id = v_uid;
-  return jsonb_build_object('ok', true, 'name', v);
-end $$;
-
-create or replace function public.cw_chat_send(p_text text) returns jsonb
-language plpgsql security definer set search_path = public as $$
-declare
-  v_uid text := auth.uid()::text;
-  v_fid uuid;
-  v_name text;
-  v_txt text;
-  v_id bigint;
-begin
-  if v_uid is null then
-    return jsonb_build_object('ok', false, 'reason', 'login');
-  end if;
-  select flotta_id, coalesce(nullif(player_name_cache, ''), 'Player') into v_fid, v_name
-    from flotta_members where user_id = v_uid order by joined_at desc limit 1;
-  if v_fid is null then
-    return jsonb_build_object('ok', false, 'reason', 'no_flotta');
-  end if;
-  v_txt := btrim(regexp_replace(coalesce(p_text, ''), '[[:cntrl:]]+', ' ', 'g'));
-  if length(v_txt) = 0 then
-    return jsonb_build_object('ok', false, 'reason', 'empty');
-  end if;
-  v_txt := cw__clean(left(v_txt, 300));
-  if (select count(*) from flotta_chat where uid = v_uid and created_at > now() - interval '10 seconds') >= 3 then
-    return jsonb_build_object('ok', false, 'reason', 'slow');
-  end if;
-  insert into flotta_chat(flotta_id, uid, sender, text, time, kind)
-    values (v_fid, v_uid, v_name, v_txt, extract(epoch from now())::bigint, 'user')
-    returning id into v_id;
-  return jsonb_build_object('ok', true, 'id', v_id);
-end $$;
-
--- cancella: il proprio messaggio, oppure Comandante/Capitano qualunque messaggio della flotta
-create or replace function public.cw_chat_delete(p_id bigint) returns jsonb
-language plpgsql security definer set search_path = public as $$
-declare
-  v_uid text := auth.uid()::text;
-  m flotta_chat%rowtype;
-  v_role text;
-begin
-  if v_uid is null then
-    return jsonb_build_object('ok', false, 'reason', 'login');
-  end if;
-  select * into m from flotta_chat where id = p_id;
-  if not found then
-    return jsonb_build_object('ok', false, 'reason', 'not_found');
-  end if;
-  select role into v_role from flotta_members where user_id = v_uid and flotta_id = m.flotta_id;
-  if v_role is null or (m.uid <> v_uid and v_role not in ('leader', 'vice')) then
-    return jsonb_build_object('ok', false, 'reason', 'not_leader');
-  end if;
-  delete from flotta_chat where id = p_id;
-  return jsonb_build_object('ok', true);
-end $$;
-
-create or replace function public.cw_chat_report(p_id bigint, p_reason text default '') returns jsonb
-language plpgsql security definer set search_path = public as $$
-declare
-  v_uid text := auth.uid()::text;
-  m flotta_chat%rowtype;
-begin
-  if v_uid is null then
-    return jsonb_build_object('ok', false, 'reason', 'login');
-  end if;
-  select * into m from flotta_chat where id = p_id;
-  if not found then
-    return jsonb_build_object('ok', false, 'reason', 'not_found');
-  end if;
-  if (select count(*) from cw_chat_reports where reporter = v_uid and created_at > now() - interval '1 hour') >= 20 then
-    return jsonb_build_object('ok', false, 'reason', 'slow');
-  end if;
-  insert into cw_chat_reports(message_id, flotta_id, reporter, author, text, reason)
-    values (m.id, m.flotta_id, v_uid, m.uid, m.text, left(coalesce(p_reason, ''), 200));
-  return jsonb_build_object('ok', true);
-end $$;
-
--- ---------- storico guerre ----------
-create or replace function public.cw_war_history() returns jsonb
-language plpgsql security definer set search_path = public as $$
-declare
-  v_uid text := auth.uid()::text;
-  v_fid uuid;
-begin
-  if v_uid is null then
-    return jsonb_build_object('ok', false, 'reason', 'login');
-  end if;
-  select flotta_id into v_fid from flotta_members where user_id = v_uid order by joined_at desc limit 1;
-  return jsonb_build_object('ok', true,
-    'wars', (select coalesce(jsonb_agg(x order by (x ->> 'ended')::bigint desc), '[]'::jsonb) from (
-      select jsonb_build_object(
-        'id', w.id, 'ended', cw__ep(w.ends_at), 'size', w.size, 'is_shadow', w.is_shadow,
-        'my_name', case when w.flotta_a = v_fid then w.name_a else w.name_b end,
-        'enemy_name', case when w.flotta_a = v_fid then w.name_b else w.name_a end,
-        'my_score', case when w.flotta_a = v_fid then w.score_a else w.score_b end,
-        'enemy_score', case when w.flotta_a = v_fid then w.score_b else w.score_a end,
-        'result', case when w.winner = 'draw' then 'draw'
-                       when w.winner = (case when w.flotta_a = v_fid then 'a' else 'b' end) then 'win' else 'loss' end) x
-      from cw_wars w
-      where w.status = 'ended' and v_fid is not null and (w.flotta_a = v_fid or w.flotta_b = v_fid)
-      order by w.ends_at desc limit 20) t));
-end $$;
-
-create or replace function public.cw_war_detail(p_war uuid) returns jsonb
-language plpgsql security definer set search_path = public as $$
-declare
-  v_uid text := auth.uid()::text;
-  v_fid uuid;
-  w cw_wars%rowtype;
-  v_my text;
-begin
-  if v_uid is null then
-    return jsonb_build_object('ok', false, 'reason', 'login');
-  end if;
-  select flotta_id into v_fid from flotta_members where user_id = v_uid order by joined_at desc limit 1;
-  select * into w from cw_wars where id = p_war;
-  if not found then
-    return jsonb_build_object('ok', false, 'reason', 'not_found');
-  end if;
-  if exists (select 1 from cw_participants where war_id = p_war and user_id = v_uid) then
-    select side into v_my from cw_participants where war_id = p_war and user_id = v_uid;
-  elsif w.flotta_a = v_fid then
-    v_my := 'a';
-  elsif w.flotta_b = v_fid then
-    v_my := 'b';
-  else
-    return jsonb_build_object('ok', false, 'reason', 'not_found');
-  end if;
-  return jsonb_build_object('ok', true,
-    'my_name', case when v_my = 'a' then w.name_a else w.name_b end,
-    'enemy_name', case when v_my = 'a' then w.name_b else w.name_a end,
-    'my_score', case when v_my = 'a' then w.score_a else w.score_b end,
-    'enemy_score', case when v_my = 'a' then w.score_b else w.score_a end,
-    'mine', (select coalesce(jsonb_agg(jsonb_build_object('name', p.player_name, 'points', p.points, 'attacks', p.attacks_used,
-                                                          'defeated', p.defeated_count, 'is_me', p.user_id = v_uid)
-                                       order by p.points desc), '[]'::jsonb)
-             from cw_participants p where p.war_id = p_war and p.side = v_my),
-    'enemy', (select coalesce(jsonb_agg(jsonb_build_object('name', p.player_name, 'points', p.points, 'attacks', p.attacks_used,
-                                                           'defeated', p.defeated_count, 'is_me', false)
-                                        order by p.points desc), '[]'::jsonb)
-              from cw_participants p where p.war_id = p_war and p.side <> v_my));
-end $$;
-
--- ---------- descrizione e stemma: solo il Comandante ----------
--- stemma: {"shape":0-5, "bg":0-15, "pattern":0-5, "pcol":0-15, "symbol":0-15, "fg":0-15}
-create or replace function public.cw_set_flotta_look(p_desc text, p_stemma jsonb) returns jsonb
-language plpgsql security definer set search_path = public as $$
-declare
-  v_uid text := auth.uid()::text;
-  v_fid uuid;
-  v_clean jsonb := '{}'::jsonb;
-  k text;
-  v_max int;
-begin
-  if v_uid is null then
-    return jsonb_build_object('ok', false, 'reason', 'login');
-  end if;
-  select flotta_id into v_fid from flotta_members where user_id = v_uid and role = 'leader' order by joined_at desc limit 1;
-  if v_fid is null then
-    return jsonb_build_object('ok', false, 'reason', 'not_leader');
-  end if;
-  if p_stemma is not null and jsonb_typeof(p_stemma) = 'object' then
-    foreach k in array array['shape', 'bg', 'pattern', 'pcol', 'symbol', 'fg'] loop
-      v_max := case when k in ('shape', 'pattern') then 5 else 15 end;
-      v_clean := v_clean || jsonb_build_object(k, least(greatest(coalesce((p_stemma ->> k)::int, 0), 0), v_max));
-    end loop;
-    update flotte set stemma = v_clean where id = v_fid;
-  end if;
-  if p_desc is not null then
-    update flotte set descrizione = cw__clean(left(btrim(regexp_replace(p_desc, '[[:cntrl:]]+', ' ', 'g')), 200)) where id = v_fid;
-  end if;
-  perform cw__sysmsg(v_fid, '🛡️ Il Comandante ha aggiornato lo stemma e la descrizione della flotta',
-    cw__m(null, '["🛡️ Il Comandante ha aggiornato lo stemma e la descrizione della flotta"]'));
-  return jsonb_build_object('ok', true, 'stemma', v_clean);
-exception when invalid_text_representation then
-  return jsonb_build_object('ok', false, 'reason', 'stemma');
-end $$;
-
--- ricalcolo della forza di tutte le difese con i valori delle carte
-update public.cw_defenses set power = public.cw__deck_value(deck);
-update public.cw_participants cp set power = public.cw__deck_value(cp.deck)
-  from public.cw_wars w where w.id = cp.war_id and w.status = 'open';
-
-
--- ---------- backup e cambio telefono ----------
--- "Esporta" salva i dati sul server e dà un codice corto (es. K7P2-9QXA), valido 30 giorni e usabile una volta.
--- "Importa" sul telefono nuovo: il server ridà i dati (che nessuno può modificare)
--- e sposta sull'account nuovo flotta, guerre, baule, premi e avvisi del vecchio account.
-create table if not exists public.cw_backups (
-  code       text primary key,
-  user_id    text not null,
-  data       jsonb not null,
-  created_at timestamptz not null default now(),
-  used_at    timestamptz,
-  used_by    text
-);
-create index if not exists cw_backups_user on public.cw_backups(user_id);
-alter table public.cw_backups enable row level security;
-revoke all on public.cw_backups from anon, authenticated;
-
-create or replace function public.cw_backup_create(p_data jsonb) returns jsonb
-language plpgsql security definer set search_path = public as $$
-declare
-  v_uid text := auth.uid()::text;
-  v_code text;
-  v_try int := 0;
-  v_chars text := 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';   -- niente 0/O e 1/I, che si confondono
-  i int;
-begin
-  if v_uid is null then
-    return jsonb_build_object('ok', false, 'reason', 'login');
-  end if;
-  if p_data is null or jsonb_typeof(p_data) <> 'object' or pg_column_size(p_data) > 400000 then
-    return jsonb_build_object('ok', false, 'reason', 'backup_data');
-  end if;
-  if (select count(*) from cw_backups where user_id = v_uid and created_at > now() - interval '1 minute') >= 3 then
-    return jsonb_build_object('ok', false, 'reason', 'slow');
-  end if;
-  -- un solo codice valido per giocatore: quelli vecchi non usati spariscono
-  delete from cw_backups where user_id = v_uid and used_at is null;
-  loop
-    v_code := '';
-    for i in 1..8 loop
-      v_code := v_code || substr(v_chars, 1 + floor(random() * length(v_chars))::int, 1);
-      if i = 4 then v_code := v_code || '-'; end if;
-    end loop;
-    exit when not exists (select 1 from cw_backups where code = v_code);
-    v_try := v_try + 1;
-    if v_try > 20 then
-      return jsonb_build_object('ok', false, 'reason', 'server');
-    end if;
-  end loop;
-  insert into cw_backups(code, user_id, data) values (v_code, v_uid, p_data);
-  return jsonb_build_object('ok', true, 'code', v_code, 'expires_at', cw__ep(now() + interval '30 days'));
-end $$;
-
--- sposta tutto quello che appartiene a un account su un altro (solo tabelle e colonne che esistono)
-create or replace function public.cw__move_account(p_old text, p_new text) returns void
-language plpgsql security definer set search_path = public as $$
-declare
-  t record;
-begin
-  if p_old is null or p_new is null or p_old = p_new then
-    return;
-  end if;
-  -- l'account nuovo è appena nato: tolgo le sue righe vuote che darebbero conflitto
-  delete from flotta_members where user_id = p_new;
-  delete from cw_defenses where user_id = p_new;
-  delete from cw_chest where user_id = p_new;
-  delete from users where uid = p_new and exists (select 1 from users where uid = p_old);
-  for t in
-    select * from (values
-      ('users', 'uid'), ('flotta_members', 'user_id'), ('flotte', 'created_by'),
-      ('cw_defenses', 'user_id'), ('cw_participants', 'user_id'), ('cw_attacks', 'attacker_id'),
-      ('cw_attacks', 'defender_id'), ('cw_rewards', 'user_id'), ('cw_chest', 'user_id'),
-      ('cw_notifications', 'user_id'), ('flotta_chat', 'uid'), ('cw_chat_reports', 'reporter'),
-      ('cw_chat_reports', 'author'), ('cw_backups', 'user_id')
-    ) as x(tab, col)
-  loop
-    if exists (select 1 from information_schema.columns
-               where table_schema = 'public' and table_name = t.tab and column_name = t.col) then
-      execute format('update public.%I set %I = $1 where %I = $2', t.tab, t.col, t.col) using p_new, p_old;
-    end if;
-  end loop;
-end $$;
-
-create or replace function public.cw_backup_claim(p_code text) returns jsonb
-language plpgsql security definer set search_path = public as $$
-declare
-  v_uid text := auth.uid()::text;
-  b cw_backups%rowtype;
-  v_code text := upper(regexp_replace(coalesce(p_code, ''), '[^A-Za-z0-9]', '', 'g'));
-  v_moved boolean := false;
-begin
-  if v_uid is null then
-    return jsonb_build_object('ok', false, 'reason', 'login');
-  end if;
-  if length(v_code) <> 8 then
-    return jsonb_build_object('ok', false, 'reason', 'backup_code');
-  end if;
-  v_code := substr(v_code, 1, 4) || '-' || substr(v_code, 5, 4);
-  select * into b from cw_backups where code = v_code for update;
-  if not found or b.used_at is not null or b.created_at < now() - interval '30 days' then
-    return jsonb_build_object('ok', false, 'reason', 'backup_code');
-  end if;
-  if b.user_id <> v_uid then
-    perform cw__move_account(b.user_id, v_uid);
-    v_moved := true;
-  end if;
-  update cw_backups set used_at = now(), used_by = v_uid where code = v_code;
-  return jsonb_build_object('ok', true, 'data', b.data, 'account_moved', v_moved);
-end $$;
-
--- ---------- 5) permessi: l'app può chiamare solo queste ----------
-do $$
-declare r record;
-begin
-  for r in
-    select p.proname, pg_get_function_identity_arguments(p.oid) args
-    from pg_proc p join pg_namespace n on n.oid = p.pronamespace
-    where n.nspname = 'public' and p.proname like 'cw\_%'
-  loop
-    execute format('revoke execute on function public.%I(%s) from public, anon, authenticated', r.proname, r.args);
-  end loop;
-end $$;
-grant execute on function public.cw_my_status() to authenticated;
-grant execute on function public.cw_save_defense(jsonb, int) to authenticated;
-grant execute on function public.cw_set_opted(boolean) to authenticated;
-grant execute on function public.cw_start_attack(text) to authenticated;
-grant execute on function public.cw_finish_attack(uuid, int, int, jsonb) to authenticated;
-grant execute on function public.cw_replace_dead(jsonb) to authenticated;
-grant execute on function public.cw_open_chest() to authenticated;
-grant execute on function public.cw_set_name(text) to authenticated;
-grant execute on function public.cw_backup_create(jsonb) to authenticated;
-grant execute on function public.cw_backup_claim(text) to authenticated;
-grant execute on function public.cw_claim_rewards() to authenticated;
-grant execute on function public.cw_leave_flotta() to authenticated;
-grant execute on function public.cw_flotta_members(uuid) to authenticated;
-grant execute on function public.cw_member_cards(text) to authenticated;
-grant execute on function public.cw_set_role(text, text) to authenticated;
-grant execute on function public.cw_kick(text) to authenticated;
-grant execute on function public.cw_notifications_list() to authenticated;
-grant execute on function public.cw_notifications_read(bigint) to authenticated;
-grant execute on function public.cw_chat_list(bigint) to authenticated;
-grant execute on function public.cw_chat_send(text) to authenticated;
-grant execute on function public.cw_chat_delete(bigint) to authenticated;
-grant execute on function public.cw_chat_report(bigint, text) to authenticated;
-grant execute on function public.cw_war_history() to authenticated;
-grant execute on function public.cw_war_detail(uuid) to authenticated;
-grant execute on function public.cw_set_flotta_look(text, jsonb) to authenticated;
-
--- ---------- 6) orologio: ogni 5 minuti ----------
-do $$
-declare j record;
-begin
-  if not exists (select 1 from pg_extension where extname = 'pg_cron') then
-    if exists (select 1 from pg_available_extensions where name = 'pg_cron') then
-      create extension pg_cron with schema pg_catalog;
-    end if;
-  end if;
-  if to_regclass('cron.job') is not null then
-    for j in execute 'select jobid from cron.job where jobname = ''nexus_cw_tick''' loop
-      execute format('select cron.unschedule(%s)', j.jobid);
-    end loop;
-    execute $c$select cron.schedule('nexus_cw_tick', '*/5 * * * *', 'select public.cw_tick()')$c$;
-    raise notice 'Orologio della guerra attivo (ogni 5 minuti).';
-  else
-    raise notice 'ATTENZIONE: pg_cron non disponibile. Attivalo in Database > Extensions e rilancia questo script.';
-  end if;
-end $$;
-
--- ---------- controllo ----------
-select 'prossima guerra' as cosa, to_char(cw_slot_after(now()) at time zone 'Europe/Rome', 'Dy DD/MM HH24:MI') || ' (ora italiana)' as valore
-union all
-select 'difese salvate', count(*)::text from cw_defenses
-union all
-select 'guerre aperte', count(*)::text from cw_wars where status = 'open'
-union all
-select 'orologio', case when to_regclass('cron.job') is null then 'pg_cron NON attivo' else 'ok' end;
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Privacy Policy - Nexus Core</title>
+<style>
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; line-height:1.6; max-width:900px; margin:0 auto; padding:24px; background:#0a0f1a; color:#e2e8f0; }
+h1 { color:#5de8ff; border-bottom:2px solid #1e3a5f; padding-bottom:12px; }
+h2 { color:#ebcb8b; margin-top:32px; }
+a { color:#5de8ff; }
+.card { background:#111a2a; border:1px solid #1e3a5f; border-radius:12px; padding:20px; margin:16px 0; }
+.small { color:#8c95a0; font-size:0.9em; }
+.lang { display:inline-block; margin:0 8px 0 0; padding:6px 14px; border:1px solid #1e3a5f; border-radius:8px; text-decoration:none; }
+hr { border:0; border-top:1px solid #1e3a5f; margin:40px 0; }
+ul { padding-left:20px; }
+</style>
+</head>
+<body>
+<p><a class="lang" href="#it">🇮🇹 Italiano</a><a class="lang" href="#en">🇬🇧 English</a></p>
+
+<!-- ============================== ITALIANO ============================== -->
+<section id="it">
+<h1>PRIVACY POLICY - NEXUS CORE</h1>
+<p class="small">Ultimo aggiornamento: 20 Ottobre 2026<br>App: Nexus Core (com.nexus.game)<br>Versione valida per Google Play e AdMob</p>
+
+<div class="card">
+<h2>1. TITOLARE DEL TRATTAMENTO</h2>
+<p><strong>Flavio Berti</strong> - NeonCore Studio<br>
+Email: <a href="mailto:flavio@flavioberti.it">flavio@flavioberti.it</a><br>
+Sede: Santarcangelo di Romagna, Emilia-Romagna, Italia<br>
+Contatto privacy: flavio@flavioberti.it (oggetto: "Privacy - Nexus Core")</p>
+</div>
+
+<h2>2. DATI RACCOLTI</h2>
+<p>L'app Nexus Core raccoglie:</p>
+<ul>
+<li><strong>Nickname giocatore</strong> (scelto da te)</li>
+<li><strong>ID utente anonimo</strong> (generato automaticamente, non legato a email o numero di telefono)</li>
+<li><strong>Dati di gioco:</strong> CORE, Gold, Frammenti, carte possedute e livelli di fusione, livello, mazzi, progresso di Scavo, Battaglie e Flotta</li>
+<li><strong>Dati tecnici:</strong> modello del dispositivo, versione del sistema operativo, lingua, log crash anonimi</li>
+<li><strong>Se entri in una Flotta:</strong>
+  <ul>
+  <li>nome, stemma, descrizione e codice della Flotta, il tuo grado (Comandante, Capitano, Pilota)</li>
+  <li>la tua <strong>difesa di guerra</strong> (20 carte con le stelle di fusione) e se partecipi alle guerre</li>
+  <li>risultati delle guerre: attacchi, punti, premi, storico, baule di guerra</li>
+  <li>i <strong>messaggi della chat</strong> di Flotta che scrivi</li>
+  <li>le <strong>segnalazioni</strong> di messaggi che invii (messaggio segnalato, chi segnala, motivo)</li>
+  <li>gli <strong>avvisi in gioco</strong> che ti riguardano (es. "la tua difesa è stata attaccata")</li>
+  </ul>
+</li>
+<li><strong>Se guardi video premio:</strong> interazioni con annunci (tramite Google AdMob)</li>
+<li><strong>Se acquisti pack:</strong> ID del prodotto acquistato (gestione Google Play Billing, non vediamo i dati della carta)</li>
+</ul>
+<p><strong>NON raccogliamo:</strong> nome reale, email (a parte quella che ci scrivi tu), numero di telefono, posizione precisa GPS, contatti, foto, rubrica.</p>
+
+<h2>3. COME USIAMO I DATI</h2>
+<ul>
+<li>Salvare il progresso sul dispositivo e sul server Supabase (Flotta, guerre, backup)</li>
+<li>Abbinare le Flotte nelle guerre di Flotta (automatiche il martedì alle 21:00 e il sabato alle 15:00, ora italiana, durata 24 ore)</li>
+<li>Mostrare classifiche, storico delle guerre e trofei</li>
+<li>Far funzionare la chat di Flotta e la moderazione (segnalazioni, filtro parolacce)</li>
+<li>Mostrare video con premio opzionali tramite AdMob</li>
+<li>Gestire gli acquisti in-app (pack, Gold, Core, rimozione annunci)</li>
+<li>Supporto e correzione dei crash</li>
+</ul>
+<p><strong>Base legale:</strong> esecuzione del contratto (fornire il gioco), legittimo interesse (sicurezza, moderazione e miglioramento del gioco), consenso per gli annunci personalizzati (UMP in UE).</p>
+
+<h2>4. CHAT DI FLOTTA E MODERAZIONE</h2>
+<ul>
+<li>I messaggi sono visibili solo ai membri della tua Flotta.</li>
+<li>Un filtro automatico sostituisce le parolacce con asterischi prima di salvare il messaggio.</li>
+<li>Puoi <strong>segnalare</strong> un messaggio: la segnalazione arriva a noi per la verifica. Il Comandante e i Capitani possono cancellare i messaggi della Flotta.</li>
+<li>Puoi <strong>silenziare</strong> un giocatore: questa scelta resta solo sul tuo dispositivo.</li>
+<li>Non scrivere in chat dati personali (indirizzo, telefono, email).</li>
+</ul>
+
+<h2>5. NOTIFICHE</h2>
+<p>Il gioco usa <strong>notifiche locali</strong>, programmate sul tuo dispositivo (inizio e fine guerra, ticket pieni, ricompense). Non usiamo servizi di notifica push e non raccogliamo identificativi per le notifiche. Puoi disattivarle in qualsiasi momento dalle impostazioni di Android.</p>
+
+<h2>6. DOVE SONO SALVATI</h2>
+<ul>
+<li><strong>Locale:</strong> sul tuo dispositivo (salvataggio del gioco, impostazioni, giocatori silenziati)</li>
+<li><strong>Cloud:</strong> Supabase (server UE, conforme al GDPR): dati di gioco online, Flotta, guerre, chat e avvisi</li>
+<li><strong>Backup per cambiare telefono:</strong> se premi Esporta, una copia dei tuoi dati di gioco viene salvata sul server e ricevi un codice personale. Il codice vale 30 giorni e si usa una sola volta: sul telefono nuovo riporta i dati e sposta flotta, guerre e baule sul nuovo account. Dopo 30 giorni la copia viene cancellata.</li>
+</ul>
+
+<h2>7. CONDIVISIONE</h2>
+<p>Non vendiamo dati. Li condividiamo solo con:</p>
+<ul>
+<li><strong>Supabase</strong> (hosting dei dati di gioco) - DPA firmato, server UE - <a href="https://supabase.com/privacy" target="_blank">Privacy</a></li>
+<li><strong>Google AdMob</strong> (video con premio opzionali): ID pubblicitario Android, indirizzo IP approssimativo, interazioni con gli annunci, informazioni sul dispositivo. Privacy: <a href="https://policies.google.com/privacy" target="_blank">policies.google.com/privacy</a> - Tecnologie annunci: <a href="https://policies.google.com/technologies/ads" target="_blank">policies.google.com/technologies/ads</a>. Opt-out: Impostazioni Android &gt; Privacy &gt; Annunci &gt; Elimina ID pubblicitario.</li>
+<li><strong>Google Play Billing</strong> (acquisti in-app): gestito interamente da Google, noi riceviamo solo la conferma dell'acquisto, mai i dati della carta. Privacy: <a href="https://policies.google.com/privacy" target="_blank">Google Privacy</a></li>
+<li><strong>Google Play Services</strong> (aggiornamenti e acquisti)</li>
+<li><strong>Altri giocatori:</strong> vedono il tuo nickname, la tua Flotta (nome, stemma, descrizione), il tuo grado, le carte della tua difesa di guerra, i tuoi punti e risultati in guerra e i messaggi che scrivi nella chat della tua Flotta. Non vedono mai il tuo ID o la tua email.</li>
+</ul>
+
+<h2>8. CONSERVAZIONE</h2>
+<ul>
+<li>Dati locali: finché non disinstalli il gioco o cancelli il salvataggio</li>
+<li>Dati cloud di gioco e Flotta: finché esiste il tuo account, così puoi riprendere a giocare anche dopo molto tempo. Puoi chiederne la cancellazione in qualsiasi momento (vedi punto 9)</li>
+<li>Chat di Flotta: 14 giorni</li>
+<li>Avvisi in gioco: 30 giorni</li>
+<li>Copie di backup per cambiare telefono: 30 giorni</li>
+<li>Segnalazioni: il tempo necessario alla verifica, al massimo 12 mesi</li>
+<li>Storico delle guerre e premi: finché esiste il tuo account</li>
+<li>Dati AdMob: secondo la policy di Google (fino a 14 mesi)</li>
+</ul>
+
+<h2>9. CANCELLAZIONE DELL'ACCOUNT E DEI DATI</h2>
+<div class="card">
+<p>Per cancellare il tuo account e <strong>tutti i dati di gioco</strong> sui nostri server scrivi a <a href="mailto:flavio@flavioberti.it?subject=Cancellazione%20account%20-%20Nexus%20Core">flavio@flavioberti.it</a> con oggetto "Cancellazione account - Nexus Core", indicando il tuo <strong>nickname</strong> e, se possibile, il nome della tua Flotta.</p>
+<p>Cancelliamo account, progressi online, difese, partecipazioni alle guerre, messaggi e avvisi <strong>entro 30 giorni</strong> e ti confermiamo via email. Possiamo conservare solo ciò che è obbligatorio per legge (es. dati degli acquisti gestiti da Google). I dati sul tuo telefono si cancellano disinstallando il gioco.</p>
+</div>
+
+<h2>10. DIRITTI GDPR (UE)</h2>
+<p>Hai diritto a: accesso, rettifica, cancellazione, limitazione, portabilità, opposizione, revoca del consenso agli annunci.</p>
+<p>Scrivi a: <a href="mailto:flavio@flavioberti.it">flavio@flavioberti.it</a> con oggetto "GDPR - [tuo nickname]".<br>
+Rispondiamo entro 30 giorni.</p>
+<p>Puoi anche presentare reclamo al Garante per la protezione dei dati personali (<a href="https://www.garanteprivacy.it" target="_blank">garanteprivacy.it</a>).</p>
+
+<h2>11. MINORI</h2>
+<p>Gioco classificato <strong>7+</strong>. Non raccogliamo consapevolmente dati di minori di 13 anni senza il consenso dei genitori. La chat di Flotta ha un filtro automatico per le parolacce, la possibilità di segnalare i messaggi e di silenziare i giocatori. Se sei un genitore e pensi che tuo figlio ci abbia fornito dati, scrivici a flavio@flavioberti.it: li cancelliamo subito.</p>
+
+<h2>12. SICUREZZA</h2>
+<ul>
+<li>Connessioni cifrate HTTPS/TLS</li>
+<li>Accesso anonimo con token, nessuna password salvata in chiaro</li>
+<li>Dati sul server protetti da regole di accesso: ogni giocatore può leggere e modificare solo ciò che gli spetta</li>
+<li>Codice di backup personale e monouso: non condividerlo, chi lo usa per primo riceve il tuo account</li>
+<li>Acquisti verificati tramite Google Play Billing (nessun dato della carta salvato da noi)</li>
+</ul>
+
+<h2>13. COOKIE / TRACKING / PUBBLICITÀ</h2>
+<div class="card">
+<p><strong>L'app mostra video opzionali con premio</strong> tramite Google AdMob.</p>
+<p>AdMob può usare:</p>
+<ul>
+<li>l'ID pubblicitario Android per mostrare annunci più pertinenti</li>
+<li>l'indirizzo IP approssimativo per una geolocalizzazione generale (es. il paese)</li>
+<li><strong>UMP (User Messaging Platform):</strong> in UE ti mostriamo un popup per chiedere il consenso agli annunci personalizzati, come richiesto da Google. Puoi scegliere "Personalizzati" o "Non personalizzati" e cambiare scelta in qualsiasi momento.</li>
+</ul>
+<p><strong>Come disattivare la personalizzazione:</strong><br>
+Android &gt; Impostazioni &gt; Privacy &gt; Annunci &gt; Disattiva personalizzazione annunci OPPURE Elimina ID pubblicitario</p>
+<p><strong>Rimozione annunci:</strong> il prodotto "no_ads" rimuove i video promozionali.</p>
+<p>Nessun Facebook Pixel. Nessun altro tracker oltre ad AdMob e Play Billing.</p>
+</div>
+
+<h2>14. MODIFICHE</h2>
+<p>Se cambiamo questa policy, lo comunichiamo nel gioco e aggiorniamo la data in alto.</p>
+
+<h2>15. CONTATTI</h2>
+<p>Privacy e supporto: <a href="mailto:flavio@flavioberti.it">flavio@flavioberti.it</a><br>
+Titolare: Flavio Berti, Santarcangelo di Romagna (RN), Italia</p>
+</section>
+
+<hr>
+
+<!-- ============================== ENGLISH ============================== -->
+<section id="en" lang="en">
+<h1>PRIVACY POLICY - NEXUS CORE</h1>
+<p class="small">Last updated: 20 October 2026<br>App: Nexus Core (com.nexus.game)<br>Valid for Google Play and AdMob</p>
+
+<div class="card">
+<h2>1. DATA CONTROLLER</h2>
+<p><strong>Flavio Berti</strong> - NeonCore Studio<br>
+Email: <a href="mailto:flavio@flavioberti.it">flavio@flavioberti.it</a><br>
+Address: Santarcangelo di Romagna, Emilia-Romagna, Italy<br>
+Privacy contact: flavio@flavioberti.it (subject: "Privacy - Nexus Core")</p>
+</div>
+
+<h2>2. DATA WE COLLECT</h2>
+<ul>
+<li><strong>Player nickname</strong> (chosen by you)</li>
+<li><strong>Anonymous user ID</strong> (generated automatically, not linked to an email or phone number)</li>
+<li><strong>Game data:</strong> CORE, Gold, Fragments, owned cards and fusion levels, level, decks, Dig, Battle and Fleet progress</li>
+<li><strong>Technical data:</strong> device model, OS version, language, anonymous crash logs</li>
+<li><strong>If you join a Fleet:</strong>
+  <ul>
+  <li>Fleet name, emblem, description and code, your rank (Commander, Captain, Pilot)</li>
+  <li>your <strong>war defense</strong> (20 cards with fusion stars) and whether you take part in wars</li>
+  <li>war results: attacks, points, rewards, history, war chest</li>
+  <li>the <strong>Fleet chat messages</strong> you write</li>
+  <li>the <strong>reports</strong> you send (reported message, reporter, reason)</li>
+  <li>the <strong>in-game notices</strong> about you (e.g. "your defense was attacked")</li>
+  </ul>
+</li>
+<li><strong>If you watch rewarded videos:</strong> ad interactions (via Google AdMob)</li>
+<li><strong>If you buy packs:</strong> the purchased product ID (handled by Google Play Billing; we never see card details)</li>
+</ul>
+<p><strong>We do NOT collect:</strong> real name, email (except when you write to us), phone number, precise GPS location, contacts, photos, address book.</p>
+
+<h2>3. HOW WE USE DATA</h2>
+<ul>
+<li>Saving your progress on your device and on the Supabase server (Fleet, wars, backup)</li>
+<li>Matching Fleets for Fleet wars (automatic on Tuesday at 21:00 and Saturday at 15:00 Italian time, lasting 24 hours)</li>
+<li>Showing rankings, war history and trophies</li>
+<li>Running the Fleet chat and its moderation (reports, profanity filter)</li>
+<li>Showing optional rewarded videos via AdMob</li>
+<li>Handling in-app purchases (packs, Gold, Core, ad removal)</li>
+<li>Support and crash fixing</li>
+</ul>
+<p><strong>Legal basis:</strong> performance of a contract (providing the game), legitimate interest (security, moderation and game improvement), consent for personalized ads (UMP in the EU).</p>
+
+<h2>4. FLEET CHAT AND MODERATION</h2>
+<ul>
+<li>Messages are visible only to the members of your Fleet.</li>
+<li>An automatic filter replaces swear words with asterisks before the message is saved.</li>
+<li>You can <strong>report</strong> a message: the report reaches us for review. The Commander and Captains can delete Fleet messages.</li>
+<li>You can <strong>mute</strong> a player: this choice stays only on your device.</li>
+<li>Please don't share personal data in chat (address, phone number, email).</li>
+</ul>
+
+<h2>5. NOTIFICATIONS</h2>
+<p>The game uses <strong>local notifications</strong> scheduled on your device (war start and end, full tickets, rewards). We don't use push notification services or collect notification identifiers. You can turn them off at any time in Android settings.</p>
+
+<h2>6. WHERE DATA IS STORED</h2>
+<ul>
+<li><strong>Local:</strong> on your device (game save, settings, muted players)</li>
+<li><strong>Cloud:</strong> Supabase (EU servers, GDPR compliant): online game data, Fleet, wars, chat and notices</li>
+<li><strong>Backup to change phone:</strong> when you press Export, a copy of your game data is saved on the server and you get a personal code. The code is valid for 30 days and can be used once: on your new phone it restores your data and moves your fleet, wars and chest to the new account. After 30 days the copy is deleted.</li>
+</ul>
+
+<h2>7. SHARING</h2>
+<p>We don't sell data. We only share it with:</p>
+<ul>
+<li><strong>Supabase</strong> (game data hosting) - signed DPA, EU servers - <a href="https://supabase.com/privacy" target="_blank">Privacy</a></li>
+<li><strong>Google AdMob</strong> (optional rewarded videos): Android advertising ID, approximate IP address, ad interactions, device information. Privacy: <a href="https://policies.google.com/privacy" target="_blank">policies.google.com/privacy</a> - Ad technologies: <a href="https://policies.google.com/technologies/ads" target="_blank">policies.google.com/technologies/ads</a>. Opt-out: Android Settings &gt; Privacy &gt; Ads &gt; Delete advertising ID.</li>
+<li><strong>Google Play Billing</strong> (in-app purchases): fully handled by Google; we only receive the purchase confirmation, never card details. Privacy: <a href="https://policies.google.com/privacy" target="_blank">Google Privacy</a></li>
+<li><strong>Google Play Services</strong> (updates and purchases)</li>
+<li><strong>Other players:</strong> can see your nickname, your Fleet (name, emblem, description), your rank, the cards in your war defense, your war points and results, and the messages you write in your Fleet's chat. They never see your ID or email.</li>
+</ul>
+
+<h2>8. RETENTION</h2>
+<ul>
+<li>Local data: until you uninstall the game or delete your save</li>
+<li>Cloud game and Fleet data: as long as your account exists, so you can come back and play even after a long time. You can ask us to delete them at any time (see section 9)</li>
+<li>Fleet chat: 14 days</li>
+<li>In-game notices: 30 days</li>
+<li>Backup copies for changing phone: 30 days</li>
+<li>Reports: as long as needed for review, at most 12 months</li>
+<li>War history and rewards: as long as your account exists</li>
+<li>AdMob data: per Google's policy (up to 14 months)</li>
+</ul>
+
+<h2>9. ACCOUNT AND DATA DELETION</h2>
+<div class="card">
+<p>To delete your account and <strong>all game data</strong> on our servers, email <a href="mailto:flavio@flavioberti.it?subject=Account%20deletion%20-%20Nexus%20Core">flavio@flavioberti.it</a> with the subject "Account deletion - Nexus Core", stating your <strong>nickname</strong> and, if possible, the name of your Fleet.</p>
+<p>We delete your account, online progress, defenses, war participation, messages and notices <strong>within 30 days</strong> and confirm by email. We may keep only what the law requires (e.g. purchase data handled by Google). Data on your phone is deleted by uninstalling the game.</p>
+</div>
+
+<h2>10. YOUR RIGHTS (GDPR)</h2>
+<p>You have the right to access, rectification, erasure, restriction, portability, objection and withdrawal of consent for ads.</p>
+<p>Write to: <a href="mailto:flavio@flavioberti.it">flavio@flavioberti.it</a> with the subject "GDPR - [your nickname]".<br>
+We reply within 30 days.</p>
+<p>You can also lodge a complaint with the Italian Data Protection Authority (<a href="https://www.garanteprivacy.it" target="_blank">garanteprivacy.it</a>) or your local authority.</p>
+
+<h2>11. CHILDREN</h2>
+<p>The game is rated <strong>7+</strong>. We do not knowingly collect data from children under 13 without parental consent. Fleet chat has an automatic profanity filter, and players can report messages and mute other players. If you are a parent and believe your child has given us data, email flavio@flavioberti.it and we will delete it right away.</p>
+
+<h2>12. SECURITY</h2>
+<ul>
+<li>Encrypted HTTPS/TLS connections</li>
+<li>Anonymous sign-in with a token, no passwords stored in plain text</li>
+<li>Server data protected by access rules: each player can only read and change what belongs to them</li>
+<li>Personal, single-use backup code: don't share it, whoever uses it first gets your account</li>
+<li>Purchases verified by Google Play Billing (we store no card data)</li>
+</ul>
+
+<h2>13. COOKIES / TRACKING / ADVERTISING</h2>
+<div class="card">
+<p><strong>The app shows optional rewarded videos</strong> via Google AdMob.</p>
+<p>AdMob may use:</p>
+<ul>
+<li>the Android advertising ID to show more relevant ads</li>
+<li>the approximate IP address for general location (e.g. country)</li>
+<li><strong>UMP (User Messaging Platform):</strong> in the EU we show a popup asking for consent to personalized ads, as required by Google. You can choose "Personalized" or "Non-personalized" and change your choice at any time.</li>
+</ul>
+<p><strong>How to turn off personalization:</strong><br>
+Android &gt; Settings &gt; Privacy &gt; Ads &gt; Opt out of ads personalization OR Delete advertising ID</p>
+<p><strong>Ad removal:</strong> the "no_ads" product removes promotional videos.</p>
+<p>No Facebook Pixel. No trackers other than AdMob and Play Billing.</p>
+</div>
+
+<h2>14. CHANGES</h2>
+<p>If we change this policy, we announce it in the game and update the date at the top.</p>
+
+<h2>15. CONTACT</h2>
+<p>Privacy and support: <a href="mailto:flavio@flavioberti.it">flavio@flavioberti.it</a><br>
+Controller: Flavio Berti, Santarcangelo di Romagna (RN), Italy</p>
+<p class="small">In case of differences between the two versions, the Italian version prevails.</p>
+</section>
+
+</body>
+</html>
